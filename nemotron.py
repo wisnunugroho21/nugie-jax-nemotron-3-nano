@@ -20,7 +20,7 @@ What is intentionally simplified:
 - Uses a simple auxiliary load-balancing loss (minimal implementation)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
@@ -64,11 +64,18 @@ class NemotronConfig:
     # Token/model sizes
     vocab_size: int = 1000
     d_model: int = 128
-    num_layers: int = 4
 
-    # Hybrid mixer pattern; repeated across layers.
-    # Example: ("mamba", "attention") means alternating layers.
-    mixer_pattern: tuple[str, ...] = ("mamba", "attention")
+    patterns: list[tuple[str, int]] = field(
+        default_factory=[
+            ("mamba_moe", 2),
+            ("mamba_attention_moe", 1),
+            ("mamba_moe", 2),
+            ("mamba_attention_moe", 1),
+            ("mamba_moe", 2),
+            ("mamba_attention_moe", 1),
+            ("mamba_moe", 1)
+        ]
+    )
 
     # Attention (GQA)
     num_attention_heads: int = 4
@@ -111,14 +118,40 @@ class NemotronConfig:
         key = preset.strip().lower()
 
         if key in ("tiny", "default"):
-            return cls()
+            return cls(
+                patterns=[
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 1)
+                ]
+            )
 
         if key in ("paper_close", "paper-close", "paper"):
             return cls(
                 # Bigger model than tiny defaults.
                 d_model=2048,
-                num_layers=12,
-                mixer_pattern=("mamba", "attention"),
+                patterns=[
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+                    ("mamba_moe", 2),
+                    ("mamba_attention_moe", 1),
+
+                    ("mamba_moe", 3),
+
+                    ("mamba_attention_moe", 1),
+
+                    ("mamba_moe", 4),
+                ],
                 # Closer to paper-style GQA shape choices.
                 num_attention_heads=32,
                 num_kv_heads=2,
@@ -147,8 +180,7 @@ class NemotronConfig:
 
     def validate(self) -> None:
         """Checks shape constraints that must hold for this architecture."""
-        assert self.num_layers > 0, "num_layers must be > 0"
-        assert len(self.mixer_pattern) > 0, "mixer_pattern cannot be empty"
+        assert len(self.patterns) > 0, "patterns cannot be empty"
 
         # Attention output must map cleanly back to d_model.
         assert self.num_attention_heads * self.attention_head_dim == self.d_model, (
@@ -183,59 +215,36 @@ class NemotronConfig:
         )
 
 
-class NemotronBlock(nnx.Module):
+class MambaMoEBlock(nnx.Module):
     """
-    One hybrid Nemotron block.
+    Hybrid Mamba & MoE block.
 
     Block structure (pre-norm residual):
-      x = x + Mixer(RMSNorm(x))
+      x = x + Mamba(RMSNorm(x))
       x = x + MoE(RMSNorm(x))
-
-    Mixer is either:
-    - Mamba-2 block, or
-    - Grouped-query attention block
 
     This keeps the architecture simple and easy to inspect.
     """
 
     def __init__(
-        self,
-        rngs: nnx.Rngs,
-        config: NemotronConfig,
-        layer_index: int,
+            self,
+            rngs: nnx.Rngs,
+            config: NemotronConfig
     ):
-        self.layer_index = layer_index
-        self.layer_type = config.mixer_pattern[layer_index % len(config.mixer_pattern)]
-
-        self.norm_mixer = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+        self.norm_mamba = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
         self.norm_moe = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
 
-        if self.layer_type == "mamba":
-            # Reuse the already-implemented Mamba-2 block as the mixer.
-            self.mixer = Mamba2Block(
-                d_model=config.d_model,
-                d_state=config.mamba_d_state,
-                d_conv=config.mamba_d_conv,
-                expand=config.mamba_expand,
-                headdim=config.mamba_headdim,
-                ngroups=config.mamba_ngroups,
-                chunk_size=config.mamba_chunk_size,
-                rngs=rngs,
-            )
-        elif self.layer_type == "attention":
-            self.mixer = GroupedQueryAttention(
-                d_model=config.d_model,
-                num_query_heads=config.num_attention_heads,
-                num_kv_heads=config.num_kv_heads,
-                head_dim=config.attention_head_dim,
-                use_bias=False,
-                rngs=rngs,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported layer type: {self.layer_type}. "
-                "Expected one of {'mamba', 'attention'}."
-            )
+        # Reuse the already-implemented Mamba-2 block
+        self.mamba = Mamba2Block(
+            d_model=config.d_model,
+            d_state=config.mamba_d_state,
+            d_conv=config.mamba_d_conv,
+            expand=config.mamba_expand,
+            headdim=config.mamba_headdim,
+            ngroups=config.mamba_ngroups,
+            chunk_size=config.mamba_chunk_size,
+            rngs=rngs,
+        )
 
         # MoE stage after every mixer layer.
         self.moe = SparseMoE(
@@ -251,10 +260,10 @@ class NemotronBlock(nnx.Module):
         )
 
     def __call__(
-        self, x: jax.Array, return_aux_loss: bool = False
+            self, x: jax.Array, return_aux_loss: bool = False
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        # Mixer residual path.
-        x = x + self.mixer(self.norm_mixer(x))
+        # Mamba residual path.
+        x = x + self.mamba(self.norm_mamba(x))
 
         # MoE residual path.
         if return_aux_loss:
@@ -262,10 +271,81 @@ class NemotronBlock(nnx.Module):
             x = x + moe_out
             return x, moe_aux_loss
 
-        moe_out = self.moe(self.norm_moe(x), return_aux_loss=False)
-        if isinstance(moe_out, tuple):
-            raise RuntimeError("Expected SparseMoE to return only tensor output")
-        x = x + moe_out
+        x = x + self.moe(self.norm_moe(x), return_aux_loss=False)
+        return x
+
+
+class MambaAttentionMoEBlock(nnx.Module):
+    """
+    Hybrid Mamba, Attention & MoE block.
+
+    Block structure (pre-norm residual):
+      x = x + Mamba(RMSNorm(x))
+      x = x + Attention(RMSNorm(x))
+      x = x + MoE(RMSNorm(x))
+
+    This keeps the architecture simple and easy to inspect.
+    """
+
+    def __init__(
+            self,
+            rngs: nnx.Rngs,
+            config: NemotronConfig
+    ):
+        self.norm_mamba = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+        self.norm_attention = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+        self.norm_moe = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+
+        # Reuse the already-implemented Mamba-2 block as the mixer.
+        self.mamba = Mamba2Block(
+            d_model=config.d_model,
+            d_state=config.mamba_d_state,
+            d_conv=config.mamba_d_conv,
+            expand=config.mamba_expand,
+            headdim=config.mamba_headdim,
+            ngroups=config.mamba_ngroups,
+            chunk_size=config.mamba_chunk_size,
+            rngs=rngs,
+        )
+
+        self.attention = GroupedQueryAttention(
+            d_model=config.d_model,
+            num_query_heads=config.num_attention_heads,
+            num_kv_heads=config.num_kv_heads,
+            head_dim=config.attention_head_dim,
+            use_bias=False,
+            rngs=rngs,
+        )
+
+        # MoE stage after every mixer layer.
+        self.moe = SparseMoE(
+            d_model=config.d_model,
+            num_experts=config.num_experts,
+            num_shared_experts=config.num_shared_experts,
+            top_k=config.top_k,
+            expert_hidden_dim=config.expert_hidden_dim,
+            granularity_factor=config.granularity_factor,
+            scale_top_k_with_granularity=config.scale_top_k_with_granularity,
+            use_bias=False,
+            rngs=rngs,
+        )
+
+    def __call__(
+            self, x: jax.Array, return_aux_loss: bool = False
+    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        # Mamba residual path.
+        x = x + self.mamba(self.norm_mamba(x))
+
+        # Attention residual path.
+        x = x + self.attention(self.norm_attention(x))
+
+        # MoE residual path.
+        if return_aux_loss:
+            moe_out, moe_aux_loss = self.moe(self.norm_moe(x), return_aux_loss=True)
+            x = x + moe_out
+            return x, moe_aux_loss
+
+        x = x + self.moe(self.norm_moe(x), return_aux_loss=False)
         return x
 
 
@@ -285,14 +365,25 @@ class NemotronNanoLM(nnx.Module):
         self.config = config
 
         self.embedding = nnx.Embed(config.vocab_size, config.d_model, rngs=rngs)
+        self.num_layers = 0
 
-        self.num_layers = config.num_layers
-        for i in range(config.num_layers):
-            setattr(
-                self,
-                f"block_{i}",
-                NemotronBlock(config=config, layer_index=i, rngs=rngs),
-            )
+        for i in range(len(config.patterns)):
+            if config.patterns[i][0] == "mamba_moe":
+                for j in range(config.patterns[i][1]):
+                    setattr(
+                        self,
+                        f"block_{self.num_layers + j}",
+                        MambaMoEBlock(config=config, rngs=rngs),
+                    )
+            elif config.patterns[i][0] == "mamba_attention_moe":
+                for j in range(config.patterns[i][1]):
+                    setattr(
+                        self,
+                        f"block_{self.num_layers + j}",
+                        MambaAttentionMoEBlock(config=config, rngs=rngs),
+                    )
+
+            self.num_layers += config.patterns[i][1]
 
         self.final_norm = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
 
@@ -305,7 +396,7 @@ class NemotronNanoLM(nnx.Module):
         )
 
     def __call__(
-        self, token_ids: jax.Array, return_aux_loss: bool = False
+            self, token_ids: jax.Array, return_aux_loss: bool = False
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
         x = self.embedding(token_ids)
         total_aux_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -339,10 +430,10 @@ def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
 
 
 def total_training_loss(
-    logits: jax.Array,
-    labels: jax.Array,
-    moe_aux_loss: jax.Array,
-    moe_aux_loss_weight: float,
+        logits: jax.Array,
+        labels: jax.Array,
+        moe_aux_loss: jax.Array,
+        moe_aux_loss_weight: float,
 ) -> jax.Array:
     """
     Combines language-model cross-entropy and MoE auxiliary loss.
@@ -358,7 +449,7 @@ def demo(preset: str = "tiny") -> None:
     - runs a few training steps
     - confirms shapes and stable execution
     """
-    print("Initializing minimal Nemotron-style model...")
+    print("Initializing simple & minimal Nemotron 3 Nano...")
 
     config = NemotronConfig.from_preset(preset)
     rngs = nnx.Rngs(0)
