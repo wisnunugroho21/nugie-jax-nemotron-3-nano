@@ -31,26 +31,6 @@ from attention import GroupedQueryAttention
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
 
-
-class RMSNorm(nnx.Module):
-    """
-    Minimal RMSNorm implementation.
-
-    RMSNorm normalizes by root-mean-square instead of mean+variance, which is
-    the normalization style used in the Nemotron architecture description.
-    """
-
-    def __init__(self, dim: int, rngs: nnx.Rngs, eps: float = 1e-6):
-        self.dim = dim
-        self.eps = eps
-        self.scale = nnx.Param(jnp.ones((dim,), dtype=jnp.float32))
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        rms = jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + self.eps)
-        x_norm = x / rms
-        return x_norm * self.scale[...]
-
-
 @dataclass
 class NemotronConfig:
     """
@@ -231,8 +211,8 @@ class MambaMoEBlock(nnx.Module):
             rngs: nnx.Rngs,
             config: NemotronConfig
     ):
-        self.norm_mamba = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
-        self.norm_moe = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+        self.norm_mamba = nnx.RMSNorm(config.d_model, rngs=rngs)
+        self.norm_moe = nnx.RMSNorm(config.d_model, rngs=rngs)
 
         # Reuse the already-implemented Mamba-2 block
         self.mamba = Mamba2Block(
@@ -292,9 +272,9 @@ class MambaAttentionMoEBlock(nnx.Module):
             rngs: nnx.Rngs,
             config: NemotronConfig
     ):
-        self.norm_mamba = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
-        self.norm_attention = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
-        self.norm_moe = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+        self.norm_mamba = nnx.RMSNorm(config.d_model, rngs=rngs)
+        self.norm_attention = nnx.RMSNorm(config.d_model, rngs=rngs)
+        self.norm_moe = nnx.RMSNorm(config.d_model, rngs=rngs)
 
         # Reuse the already-implemented Mamba-2 block as the mixer.
         self.mamba = Mamba2Block(
@@ -385,7 +365,7 @@ class NemotronNanoLM(nnx.Module):
 
             self.num_layers += config.patterns[i][1]
 
-        self.final_norm = RMSNorm(config.d_model, eps=config.rms_norm_eps, rngs=rngs)
+        self.final_norm = nnx.RMSNorm(config.d_model, rngs=rngs)
 
         # Untied output head (separate from embeddings).
         self.lm_head = nnx.Linear(
