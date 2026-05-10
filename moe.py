@@ -1,10 +1,10 @@
 """
-Minimal DeepSeekMoE-style Sparse Mixture-of-Experts (MoE) in JAX/Flax NNX.
+Minimal Sparse Mixture-of-Experts (MoE) in JAX/Flax NNX.
 
 This module keeps the code simple and educational while reflecting the key ideas:
 - Granular routed experts: split base routed experts into finer experts.
 - Shared experts: always-on experts, isolated from routing competition.
-- Routed-only top-k sparse routing with softmax probabilities.
+- Routed-only top-k sparse routing with Nemotron-style sigmoid gating.
 - Squared-ReLU experts.
 - Simple Switch-style load-balancing auxiliary loss on routed experts.
 
@@ -64,6 +64,10 @@ class SparseMoE(nnx.Module):
     - Always active for all tokens.
     - Never participate in router competition.
     - Added as a deterministic shared pathway.
+
+    Nemotron-style routing note:
+    - Routed gates are produced by sigmoid(router_logits), then top-k is applied.
+    - This differs from softmax routing used in some other MoE variants.
 
     Args:
         granularity_factor:
@@ -194,7 +198,7 @@ class SparseMoE(nnx.Module):
         return jnp.stack(outputs, axis=1)
 
     def _load_balancing_aux_loss(
-        self, routed_probs: jax.Array, topk_indices: jax.Array
+        self, routed_scores: jax.Array, topk_indices: jax.Array
     ) -> jax.Array:
         """
         Simple Switch-style load-balancing loss for routed experts only.
@@ -204,16 +208,22 @@ class SparseMoE(nnx.Module):
         2) Mean router probability: expected mass per routed expert.
 
         Args:
-            routed_probs: softmax probabilities over routed experts,
-                          shape (num_tokens, num_routed_experts)
+            routed_scores: sigmoid routing scores over routed experts,
+                           shape (num_tokens, num_routed_experts)
             topk_indices: selected routed experts per token,
                           shape (num_tokens, routed_top_k)
         Returns:
             aux_loss: scalar
         """
-        num_tokens = routed_probs.shape[0]
+        num_tokens = routed_scores.shape[0]
 
-        dispatch_mask = jnp.zeros_like(routed_probs)
+        # For balancing statistics, convert sigmoid scores to a per-token
+        # normalized distribution over routed experts.
+        routed_probs = routed_scores / (
+            jnp.sum(routed_scores, axis=-1, keepdims=True) + 1e-6
+        )
+
+        dispatch_mask = jnp.zeros_like(routed_scores)
         token_ids = jnp.arange(num_tokens)[:, None]
         dispatch_mask = dispatch_mask.at[token_ids, topk_indices].set(1.0)
 
@@ -244,19 +254,24 @@ class SparseMoE(nnx.Module):
         num_tokens = batch * seqlen
         x_flat = jnp.reshape(x, (num_tokens, d_model))
 
-        # 1) Routed path: softmax routing over routed experts only.
+        # 1) Routed path: Nemotron-style sigmoid routing over routed experts only.
         routed_logits = self.router(x_flat)
-        routed_probs = jax.nn.softmax(routed_logits, axis=-1)
+        routed_scores = jax.nn.sigmoid(routed_logits)
 
         # 2) Sparse top-k selection among routed experts.
-        # We keep softmax weights of selected experts directly (no post-top-k renorm).
-        topk_values, topk_indices = jax.lax.top_k(routed_probs, self.routed_top_k)
+        # We select top-k experts by sigmoid scores.
+        topk_values, topk_indices = jax.lax.top_k(routed_scores, self.routed_top_k)
 
-        aux_loss = self._load_balancing_aux_loss(routed_probs, topk_indices)
+        aux_loss = self._load_balancing_aux_loss(routed_scores, topk_indices)
 
-        routed_gates = jnp.zeros_like(routed_probs)
+        routed_gates = jnp.zeros_like(routed_scores)
         token_ids = jnp.arange(num_tokens)[:, None]
         routed_gates = routed_gates.at[token_ids, topk_indices].set(topk_values)
+
+        # Renormalize selected routed gates so token output scale stays stable.
+        routed_gates = routed_gates / (
+            jnp.sum(routed_gates, axis=-1, keepdims=True) + 1e-6
+        )
 
         routed_outputs = self._collect_routed_outputs(x_flat)
         routed_mix = jnp.sum(routed_outputs * routed_gates[:, :, None], axis=1)
