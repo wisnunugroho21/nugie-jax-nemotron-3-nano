@@ -93,6 +93,53 @@ class NemotronConfig:
     # Normalization and numerical stability
     rms_norm_eps: float = 1e-6
 
+    @classmethod
+    def from_preset(cls, preset: str = "tiny") -> "NemotronConfig":
+        """
+        Builds a config from a named preset.
+
+        Presets:
+        - tiny: default local-friendly profile (fallback)
+        - paper_close: larger profile that is closer to Nemotron-3-Nano style
+
+        The paper_close preset increases attention heads, expert count, and
+        uses top_k=6 routing while still keeping this implementation simple.
+        """
+        key = preset.strip().lower()
+
+        if key in ("tiny", "default"):
+            return cls()
+
+        if key in ("paper_close", "paper-close", "paper"):
+            return cls(
+                # Bigger model than tiny defaults.
+                d_model=2048,
+                num_layers=12,
+                mixer_pattern=("mamba", "attention"),
+                # Closer to paper-style GQA shape choices.
+                num_attention_heads=32,
+                num_kv_heads=2,
+                attention_head_dim=64,
+                # Closer to paper-style Mamba settings.
+                mamba_d_state=128,
+                mamba_d_conv=4,
+                mamba_expand=2,
+                mamba_headdim=64,
+                mamba_ngroups=8,
+                mamba_chunk_size=64,
+                # Closer to paper-style MoE settings.
+                num_experts=64,
+                num_shared_experts=2,
+                top_k=6,
+                expert_hidden_dim=1856,
+                moe_aux_loss_weight=1e-4,
+                rms_norm_eps=1e-6,
+            )
+
+        raise ValueError(
+            f"Unknown preset '{preset}'. Supported presets: tiny, paper_close"
+        )
+
     def validate(self) -> None:
         """Checks shape constraints that must hold for this architecture."""
         assert self.num_layers > 0, "num_layers must be > 0"
@@ -110,6 +157,10 @@ class NemotronConfig:
         mamba_d_inner = self.mamba_expand * self.d_model
         assert mamba_d_inner % self.mamba_headdim == 0, (
             "(mamba_expand * d_model) must be divisible by mamba_headdim"
+        )
+        mamba_nheads = mamba_d_inner // self.mamba_headdim
+        assert mamba_nheads % self.mamba_ngroups == 0, (
+            "Mamba nheads must be divisible by mamba_ngroups"
         )
 
         # MoE routing constraints.
@@ -194,7 +245,10 @@ class NemotronBlock(nnx.Module):
             x = x + moe_out
             return x, moe_aux_loss
 
-        x = x + self.moe(self.norm_moe(x))
+        moe_out = self.moe(self.norm_moe(x), return_aux_loss=False)
+        if isinstance(moe_out, tuple):
+            raise RuntimeError("Expected SparseMoE to return only tensor output")
+        x = x + moe_out
         return x
 
 
@@ -280,7 +334,7 @@ def total_training_loss(
     return ce_loss + moe_aux_loss_weight * moe_aux_loss
 
 
-def demo() -> None:
+def demo(preset: str = "tiny") -> None:
     """
     Tiny smoke-test demo:
     - builds the model
@@ -289,8 +343,10 @@ def demo() -> None:
     """
     print("Initializing minimal Nemotron-style model...")
 
-    config = NemotronConfig()
+    config = NemotronConfig.from_preset(preset)
     rngs = nnx.Rngs(0)
+
+    print(f"Using config preset: {preset}")
 
     model = NemotronNanoLM(rngs=rngs, config=config)
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=1e-3), wrt=nnx.Param)
@@ -345,4 +401,10 @@ def demo() -> None:
 
 
 if __name__ == "__main__":
-    demo()
+    # Keep tiny as fallback; choose a larger profile by setting:
+    #   NEMOTRON_PRESET=paper_close
+    # before running this script.
+    import os
+
+    selected_preset = os.getenv("NEMOTRON_PRESET", "tiny")
+    demo(preset=selected_preset)
