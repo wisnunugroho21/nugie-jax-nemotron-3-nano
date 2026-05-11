@@ -11,7 +11,7 @@ What this minimal implementation keeps from the paper:
 - Sparse top-k MoE routing with shared experts
 - Squared-ReLU experts
 - RMSNorm + residual pre-norm structure
-- No positional embeddings, no dropout, and bias-free linear layers by default
+- RoPE in attention, no dropout, and bias-free linear layers by default
 
 What is intentionally simplified:
 - Tiny default dimensions for local experimentation
@@ -80,7 +80,6 @@ class NemotronConfig:
     expert_hidden_dim: int = 256
     granularity_factor: int = 1
     scale_top_k_with_granularity: bool = True
-    moe_aux_loss_weight: float = 1e-4
 
     # Normalization and numerical stability
     rms_norm_eps: float = 1e-6
@@ -141,8 +140,8 @@ class NemotronConfig:
                 top_k=6,
                 expert_hidden_dim=1856,
                 granularity_factor=2,
-                scale_top_k_with_granularity=True,
-                moe_aux_loss_weight=1e-4,
+                # Keep exactly 6 activated routed experts (paper behavior).
+                scale_top_k_with_granularity=False,
                 rms_norm_eps=1e-6,
             )
 
@@ -322,8 +321,8 @@ class NemotronNanoBlock(nnx.Module):
     Layout:
       token embedding -> N x NemotronBlock -> RMSNorm -> LM head
 
-    We intentionally do not add positional embeddings to stay aligned with the
-    architecture note in the paper.
+        RoPE is applied inside attention blocks; there is no separate learned
+        positional embedding table.
     """
 
     def __init__(self, rngs: nnx.Rngs, config: NemotronConfig):

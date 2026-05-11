@@ -36,6 +36,8 @@ def _apply_rope(x: jax.Array) -> jax.Array:
         shape (batch, seqlen, num_heads, head_dim) — position-encoded
     """
     batch, seqlen, num_heads, head_dim = x.shape
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE requires an even head_dim")
     half = head_dim // 2
 
     # Frequency for each dimension pair: θ_i = 1 / 10000^(2i / head_dim)
@@ -55,12 +57,17 @@ def _apply_rope(x: jax.Array) -> jax.Array:
     cos = cos[None, :, None, :]
     sin = sin[None, :, None, :]
 
-    # Split head dim into first and second halves
-    x1 = x[..., :half]   # even-indexed dimensions
-    x2 = x[..., half:]   # odd-indexed dimensions
+    # Split into true even/odd dimension pairs: (0,1), (2,3), ...
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
 
-    # 2D rotation: [x1, x2] → [x1·cos − x2·sin, x1·sin + x2·cos]
-    return jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+    # 2D rotation per pair: [even, odd] -> [even*cos - odd*sin, even*sin + odd*cos]
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
+
+    # Interleave rotated even/odd channels back to the original head_dim layout.
+    x_rot = jnp.stack([x_rot_even, x_rot_odd], axis=-1)
+    return jnp.reshape(x_rot, x.shape)
 
 
 class GroupedQueryAttention(nnx.Module):
@@ -99,6 +106,7 @@ class GroupedQueryAttention(nnx.Module):
         assert self.num_query_heads % self.num_kv_heads == 0, (
             "num_query_heads must be divisible by num_kv_heads for GQA"
         )
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
         assert self.num_query_heads * self.head_dim == self.d_model, (
             "d_model must equal num_query_heads * head_dim"
         )

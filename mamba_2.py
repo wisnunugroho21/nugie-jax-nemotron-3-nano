@@ -376,7 +376,7 @@ class Mamba2LMHeadModel(nnx.Module):
                 ),
             )
 
-        self.norm_f = nnx.LayerNorm(d_model, rngs=rngs)
+        self.norm_f = nnx.RMSNorm(d_model, rngs=rngs)
         self.lm_head = nnx.Linear(d_model, vocab_size, use_bias=False, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:

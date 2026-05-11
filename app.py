@@ -195,21 +195,14 @@ def cross_entropy_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
     return optax.softmax_cross_entropy(logits, one_hot).mean()
 
 
-def total_training_loss(
-    logits: jax.Array,
-    labels: jax.Array,
-    moe_aux_loss: jax.Array,
-    moe_aux_loss_weight: float,
-) -> jax.Array:
+def total_training_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
     """
-    Combines cross-entropy loss with the MoE auxiliary loss term.
+    Training loss used for Nemotron 3 Nano style MoE.
 
-    With aux-loss-free load balancing, SparseMoE always returns jnp.zeros(())
-    for the aux loss, so this is effectively just cross-entropy. The weight
-    parameter and moe_aux_loss argument are kept for API compatibility.
+    Load balancing is aux-loss-free (expert-bias updates outside gradients),
+    so the optimization target is plain next-token cross-entropy.
     """
-    ce = cross_entropy_loss(logits, labels)
-    return ce + moe_aux_loss_weight * moe_aux_loss
+    return cross_entropy_loss(logits, labels)
 
 
 def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
@@ -314,7 +307,6 @@ def train_model(
     model: NemotronNanoBlock,
     optimizer: nnx.Optimizer,
     train_tokens: jax.Array,
-    config: NemotronConfig,
     steps: int,
     batch_size: int,
     seq_len: int,
@@ -325,47 +317,25 @@ def train_model(
     @nnx.jit
     def train_step(model, optimizer, x_batch, y_batch):
         def loss_fn(model):
-            logits_local, moe_aux_local = model(x_batch, return_aux_loss=True)
-            total = total_training_loss(
-                logits=logits_local,
-                labels=y_batch,
-                moe_aux_loss=moe_aux_local,
-                moe_aux_loss_weight=config.moe_aux_loss_weight,
-            )
-            ce = cross_entropy_loss(logits_local, y_batch)
-            return total, (ce, moe_aux_local)
+            logits_local = model(x_batch, return_aux_loss=False)
+            return total_training_loss(logits=logits_local, labels=y_batch)
 
-        (total_loss, (ce_loss, moe_aux_loss)), grads = nnx.value_and_grad(
-            loss_fn, has_aux=True
-        )(model)
+        total_loss, grads = nnx.value_and_grad(loss_fn)(model)
         optimizer.update(model, grads)
 
         # Aux-loss-free load balancing: update expert biases AFTER the gradient step.
         # Uses the top-k indices stored by each SparseMoE during the forward pass.
         _update_all_expert_biases(model)
 
-        return total_loss, ce_loss, moe_aux_loss
+        return total_loss
 
     print("\nTraining:")
     for step in range(steps):
         rng_key, batch_key = jax.random.split(rng_key)
         x_batch, y_batch = sample_lm_batch(train_tokens, batch_size, seq_len, batch_key)
-        total_loss, ce_loss, moe_aux = train_step(model, optimizer, x_batch, y_batch)
+        total_loss = train_step(model, optimizer, x_batch, y_batch)
 
-        print(
-            f"  step {step + 1:>3}/{steps} | "
-            f"total={float(total_loss):.4f} | "
-            f"ce={float(ce_loss):.4f} | "
-            f"moe_aux={float(moe_aux):.4f}"
-        )
-
-        """ if step == 0 or (step + 1) % max(1, steps // 5) == 0 or step == steps - 1:
-            print(
-                f"  step {step + 1:>3}/{steps} | "
-                f"total={float(total_loss):.4f} | "
-                f"ce={float(ce_loss):.4f} | "
-                f"moe_aux={float(moe_aux):.4f}"
-            ) """
+        print(f"  step {step + 1:>3}/{steps} | ce={float(total_loss):.4f}")
 
     return rng_key
 
@@ -373,7 +343,6 @@ def train_model(
 def evaluate_model(
     model: NemotronNanoBlock,
     val_tokens: jax.Array,
-    config: NemotronConfig,
     batch_size: int,
     seq_len: int,
     eval_batches: int,
@@ -394,9 +363,9 @@ def evaluate_model(
     for _ in range(eval_batches):
         rng_key, batch_key = jax.random.split(rng_key)
         x_batch, y_batch = sample_lm_batch(val_tokens, batch_size, seq_len, batch_key)
-        logits, moe_aux = model(x_batch, return_aux_loss=True)
+        logits = model(x_batch, return_aux_loss=False)
         ce = cross_entropy_loss(logits, y_batch)
-        total = ce + config.moe_aux_loss_weight * moe_aux
+        total = ce
 
         total_losses.append(total)
         ce_losses.append(ce)
@@ -608,17 +577,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    args = build_arg_parser().parse_args()
+
+    if args.steps <= 0:
+        raise ValueError("--steps must be > 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.eval_batches <= 0:
+        raise ValueError("--eval-batches must be > 0")
+
     print("Initializing minimal Nemotron app...")
 
     # 1) Load real text data from TinyStories.
     all_stories = load_tinystories_texts(
-        max_stories=5000,
-        split="train",
-        cache_dir=None,
+        max_stories=args.tinystories_max_stories,
+        split=args.tinystories_split,
+        cache_dir=args.tinystories_cache_dir,
     )
     train_texts, val_texts = split_train_val_texts(
         stories=all_stories,
-        train_ratio=0.9,
+        train_ratio=args.tinystories_train_ratio,
     )
 
     print(
@@ -629,7 +607,7 @@ def main() -> None:
     )
 
     # Optional preview: helps beginners see real input text before tokenization.
-    if True:
+    if args.preview_first_story:
         preview = all_stories[0].replace("\n", " ").strip()
         preview_limit = 240
         if len(preview) > preview_limit:
@@ -644,27 +622,29 @@ def main() -> None:
     tokenizer.fit(all_stories)
 
     # 3) Build Nemotron config/model.
-    config = NemotronConfig.from_preset("tiny")
+    config = NemotronConfig.from_preset(args.preset)
     config.vocab_size = tokenizer.vocab_size
 
-    # if args.seq_len % config.mamba_chunk_size != 0:
-    #     raise ValueError(
-    #         f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
-    #     )
+    if args.seq_len % config.mamba_chunk_size != 0:
+        raise ValueError(
+            f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
+        )
 
-    # print(
-    #     "Model setup: "
-    #     f"preset={args.preset}, vocab_size={config.vocab_size}, "
-    #     f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
-    # )
+    print(
+        "Model setup: "
+        f"preset={args.preset}, vocab_size={config.vocab_size}, "
+        f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
+    )
 
-    rngs = nnx.Rngs(0)
+    rngs = nnx.Rngs(args.seed)
     model = NemotronNanoBlock(rngs=rngs, config=config)
 
     # Build optimizer: AdamW with warmup + cosine decay
+    max_steps = max(args.steps, 1)
+    warmup_steps = max(1, max_steps // 10)
     lr_schedule = create_lr_schedule(
-        max_steps=1000,
-        warmup_steps=200,
+        max_steps=max_steps,
+        warmup_steps=warmup_steps,
         peak_lr=3e-4,
     )
     tx = optax.chain(
@@ -674,14 +654,14 @@ def main() -> None:
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     # Use a separate key stream for data/generation randomness.
-    rng_key = jax.random.PRNGKey(0 + 1)
+    rng_key = jax.random.PRNGKey(args.seed + 1)
 
     # 4) Prepare token streams from train/validation stories.
     train_tokens, val_tokens = prepare_datasets(
         tokenizer=tokenizer,
         train_texts=train_texts,
         val_texts=val_texts,
-        seq_len=64,
+        seq_len=args.seq_len,
     )
 
     # 5) Train.
@@ -689,10 +669,9 @@ def main() -> None:
         model=model,
         optimizer=optimizer,
         train_tokens=train_tokens,
-        config=config,
-        steps=100000,
-        batch_size=32,
-        seq_len=64,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
         rng_key=rng_key,
     )
 
@@ -700,10 +679,9 @@ def main() -> None:
     mean_total, mean_ce, perplexity, rng_key = evaluate_model(
         model=model,
         val_tokens=val_tokens,
-        config=config,
-        batch_size=32,
-        seq_len=64,
-        eval_batches=32,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        eval_batches=args.eval_batches,
         rng_key=rng_key,
     )
 
@@ -713,13 +691,13 @@ def main() -> None:
     print(f"  perplexity:      {perplexity:.4f}")
 
     # 7) Chat.
-    if not False:
+    if not args.skip_chat:
         chat_loop(
             model=model,
             tokenizer=tokenizer,
-            seq_len=64,
-            temperature=0.0,
-            max_new_tokens=200,
+            seq_len=args.seq_len,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
             rng_key=rng_key,
         )
 
