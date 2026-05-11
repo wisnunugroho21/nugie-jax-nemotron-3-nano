@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from nemotron import NemotronConfig, NemotronNanoLM
+from nemotron import NemotronConfig, NemotronNanoBlock
 
 
 class CharTokenizer:
@@ -68,7 +68,9 @@ class CharTokenizer:
     def vocab_size(self) -> int:
         return len(self.token_to_id)
 
-    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> list[int]:
+    def encode(
+        self, text: str, add_bos: bool = False, add_eos: bool = False
+    ) -> list[int]:
         """Converts text to token IDs."""
         ids: list[int] = []
         if add_bos:
@@ -141,7 +143,9 @@ def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
     return jnp.tile(tokens, repeat_count)
 
 
-def prepare_datasets(tokenizer: CharTokenizer, seq_len: int) -> tuple[jax.Array, jax.Array]:
+def prepare_datasets(
+    tokenizer: CharTokenizer, seq_len: int
+) -> tuple[jax.Array, jax.Array]:
     """
     Creates train/val token streams from a tiny corpus.
 
@@ -201,7 +205,7 @@ def sample_lm_batch(
 
 
 def train_model(
-    model: NemotronNanoLM,
+    model: NemotronNanoBlock,
     optimizer: nnx.Optimizer,
     train_tokens: jax.Array,
     config: NemotronConfig,
@@ -256,7 +260,7 @@ def train_model(
 
 
 def evaluate_model(
-    model: NemotronNanoLM,
+    model: NemotronNanoBlock,
     val_tokens: jax.Array,
     config: NemotronConfig,
     batch_size: int,
@@ -329,7 +333,7 @@ def sample_next_token(
 
 
 def generate_reply(
-    model: NemotronNanoLM,
+    model: NemotronNanoBlock,
     tokenizer: CharTokenizer,
     prompt_text: str,
     seq_len: int,
@@ -344,7 +348,10 @@ def generate_reply(
     for _ in range(max_new_tokens):
         model_input = pad_or_trim_context(context_ids, seq_len, tokenizer.pad_id)
         logits = model(model_input)
-        next_logits = logits[0, -1]
+
+        next_logits: jax.Array = jnp.zeros(0)
+        if isinstance(logits, jax.Array):
+            next_logits = logits[0, -1]
 
         # Avoid sampling these two control tokens during response generation.
         next_logits = next_logits.at[tokenizer.pad_id].set(-1e9)
@@ -363,7 +370,7 @@ def generate_reply(
 
 
 def chat_loop(
-    model: NemotronNanoLM,
+    model: NemotronNanoBlock,
     tokenizer: CharTokenizer,
     seq_len: int,
     temperature: float,
@@ -408,21 +415,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal Nemotron train/eval/chat app")
     parser.add_argument("--preset", type=str, default="tiny", help="Nemotron preset")
     parser.add_argument("--steps", type=int, default=80, help="Training steps")
-    parser.add_argument("--batch-size", type=int, default=8, help="Train/eval batch size")
+    parser.add_argument(
+        "--batch-size", type=int, default=8, help="Train/eval batch size"
+    )
     parser.add_argument(
         "--seq-len",
         type=int,
         default=64,
         help="Sequence length (must be divisible by Mamba chunk size)",
     )
-    parser.add_argument("--eval-batches", type=int, default=10, help="Validation batches")
+    parser.add_argument(
+        "--eval-batches", type=int, default=10, help="Validation batches"
+    )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
         help="0 for greedy decoding, >0 for sampling",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=80, help="Max tokens per reply")
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=80, help="Max tokens per reply"
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
         "--skip-chat",
@@ -447,11 +460,8 @@ def main() -> None:
 
     if args.seq_len % config.mamba_chunk_size != 0:
         raise ValueError(
-            "seq_len must be divisible by mamba_chunk_size "
-            f"({config.mamba_chunk_size})"
+            f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
         )
-
-    train_tokens, val_tokens = prepare_datasets(tokenizer, args.seq_len)
 
     print(
         "Model setup: "
@@ -460,13 +470,16 @@ def main() -> None:
     )
 
     rngs = nnx.Rngs(args.seed)
-    model = NemotronNanoLM(rngs=rngs, config=config)
+    model = NemotronNanoBlock(rngs=rngs, config=config)
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=1e-3), wrt=nnx.Param)
 
     # Use a separate key stream for data/generation randomness.
     rng_key = jax.random.PRNGKey(args.seed + 1)
 
-    # 3) Train.
+    # 3) Prepare dataset.
+    train_tokens, val_tokens = prepare_datasets(tokenizer, args.seq_len)
+
+    # 4) Train.
     rng_key = train_model(
         model=model,
         optimizer=optimizer,
@@ -478,7 +491,7 @@ def main() -> None:
         rng_key=rng_key,
     )
 
-    # 4) Evaluate.
+    # 5) Evaluate.
     mean_total, mean_ce, perplexity, rng_key = evaluate_model(
         model=model,
         val_tokens=val_tokens,

@@ -30,7 +30,6 @@ from attention import GroupedQueryAttention
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
 
-
 BlockOutput = jax.Array | tuple[jax.Array, jax.Array]
 
 
@@ -44,6 +43,7 @@ def _default_patterns() -> list[tuple[str, int]]:
         ("mamba_attention_moe", 1),
         ("mamba_moe", 1),
     ]
+
 
 @dataclass
 class NemotronConfig:
@@ -121,11 +121,8 @@ class NemotronConfig:
                     ("mamba_attention_moe", 1),
                     ("mamba_moe", 2),
                     ("mamba_attention_moe", 1),
-
                     ("mamba_moe", 3),
-
                     ("mamba_attention_moe", 1),
-
                     ("mamba_moe", 4),
                 ],
                 # Closer to paper-style GQA shape choices.
@@ -248,11 +245,7 @@ class MambaMoEBlock(nnx.Module):
     This keeps the architecture simple and easy to inspect.
     """
 
-    def __init__(
-            self,
-            rngs: nnx.Rngs,
-            config: NemotronConfig
-    ):
+    def __init__(self, rngs: nnx.Rngs, config: NemotronConfig):
         self.norm_mamba = nnx.RMSNorm(config.d_model, rngs=rngs)
         self.norm_moe = nnx.RMSNorm(config.d_model, rngs=rngs)
 
@@ -262,9 +255,7 @@ class MambaMoEBlock(nnx.Module):
         # MoE stage after every mixer layer.
         self.moe = _build_moe(config=config, rngs=rngs)
 
-    def __call__(
-            self, x: jax.Array, return_aux_loss: bool = False
-    ) -> BlockOutput:
+    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> BlockOutput:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
@@ -289,11 +280,7 @@ class MambaAttentionMoEBlock(nnx.Module):
     This keeps the architecture simple and easy to inspect.
     """
 
-    def __init__(
-            self,
-            rngs: nnx.Rngs,
-            config: NemotronConfig
-    ):
+    def __init__(self, rngs: nnx.Rngs, config: NemotronConfig):
         self.norm_mamba = nnx.RMSNorm(config.d_model, rngs=rngs)
         self.norm_attention = nnx.RMSNorm(config.d_model, rngs=rngs)
         self.norm_moe = nnx.RMSNorm(config.d_model, rngs=rngs)
@@ -313,9 +300,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         # MoE stage after every mixer layer.
         self.moe = _build_moe(config=config, rngs=rngs)
 
-    def __call__(
-            self, x: jax.Array, return_aux_loss: bool = False
-    ) -> BlockOutput:
+    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> BlockOutput:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
@@ -331,7 +316,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         )
 
 
-class NemotronNanoLM(nnx.Module):
+class NemotronNanoBlock(nnx.Module):
     """
     Minimal Nemotron-style language model.
 
@@ -376,7 +361,7 @@ class NemotronNanoLM(nnx.Module):
         )
 
     def __call__(
-            self, token_ids: jax.Array, return_aux_loss: bool = False
+        self, token_ids: jax.Array, return_aux_loss: bool = False
     ) -> BlockOutput:
         x = self.embedding(token_ids)
         total_aux_loss = jnp.array(0.0, dtype=jnp.float32)
