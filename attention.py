@@ -5,7 +5,8 @@ This file implements a simple, educational attention block used by the
 Nemotron-style hybrid model:
 - Causal self-attention (decoder-only masking)
 - Grouped-query attention (more query heads than KV heads)
-- No dropout and no positional embedding (paper-aligned defaults)
+- Rotary Position Embeddings (RoPE, Su et al. 2021) applied to Q and K
+- No dropout, bias-free projections
 
 The implementation prioritizes readability over speed.
 """
@@ -15,12 +16,60 @@ import jax.numpy as jnp
 from flax import nnx
 
 
+def _apply_rope(x: jax.Array) -> jax.Array:
+    """
+    Apply Rotary Position Embeddings (RoPE, Su et al. 2021) to a Q or K tensor.
+
+    RoPE encodes token positions as rotations of head-dimension pairs.
+    For dimension pair (2i, 2i+1) at sequence position m, the rotation angle is:
+        θ_i = m / 10000^(2i / head_dim)
+
+    Key property: after RoPE, the dot product q·k depends only on the
+    RELATIVE position (m − n), not absolute positions. This lets the model
+    generalize to positions seen at training time.
+
+    RoPE adds no learnable parameters — it is a deterministic function of position.
+
+    Args:
+        x: shape (batch, seqlen, num_heads, head_dim) — Q or K tensor
+    Returns:
+        shape (batch, seqlen, num_heads, head_dim) — position-encoded
+    """
+    batch, seqlen, num_heads, head_dim = x.shape
+    half = head_dim // 2
+
+    # Frequency for each dimension pair: θ_i = 1 / 10000^(2i / head_dim)
+    freqs = 1.0 / (
+        10000.0 ** (jnp.arange(half, dtype=jnp.float32) * 2 / head_dim)
+    )
+
+    # Position indices 0, 1, ..., seqlen-1
+    positions = jnp.arange(seqlen, dtype=jnp.float32)
+
+    # angles[m, i] = m * θ_i, shape (seqlen, half)
+    angles = jnp.outer(positions, freqs)
+    cos = jnp.cos(angles)  # (seqlen, half)
+    sin = jnp.sin(angles)  # (seqlen, half)
+
+    # Broadcast to (1, seqlen, 1, half) for batch and head dimensions
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
+
+    # Split head dim into first and second halves
+    x1 = x[..., :half]   # even-indexed dimensions
+    x2 = x[..., half:]   # odd-indexed dimensions
+
+    # 2D rotation: [x1, x2] → [x1·cos − x2·sin, x1·sin + x2·cos]
+    return jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+
+
 class GroupedQueryAttention(nnx.Module):
     """
     Minimal causal self-attention with grouped-query heads.
 
     Paper-aligned design choices used here:
     - Query heads and KV heads can be different (GQA)
+    - Rotary Position Embeddings (RoPE) applied to Q and K
     - No dropout
     - Bias-free linear projections by default
 
@@ -102,29 +151,35 @@ class GroupedQueryAttention(nnx.Module):
         k = jnp.reshape(k, (batch, seqlen, self.num_kv_heads, self.head_dim))
         v = jnp.reshape(v, (batch, seqlen, self.num_kv_heads, self.head_dim))
 
-        # 3) Expand KV heads so each query head can attend to a matching KV head.
+        # 3) Apply RoPE to Q and K (after head split, before GQA expansion).
+        # RoPE encodes positions via rotation — applied per head, on the last dim.
+        # V is NOT rotated: position encoding only affects attention score computation.
+        q = _apply_rope(q)
+        k = _apply_rope(k)
+
+        # 4) Expand KV heads so each query head can attend to a matching KV head.
         kv_repeat = self.num_query_heads // self.num_kv_heads
         k = jnp.repeat(k, kv_repeat, axis=2)
         v = jnp.repeat(v, kv_repeat, axis=2)
 
-        # 4) Move heads before sequence for standard attention math.
+        # 5) Move heads before sequence for standard attention math.
         q = jnp.transpose(q, (0, 2, 1, 3))  # (batch, heads, seqlen, head_dim)
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
 
-        # 5) Dot-product attention scores.
+        # 6) Dot-product attention scores.
         scale = 1.0 / jnp.sqrt(self.head_dim)
         scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
 
-        # 6) Causal mask: position i cannot see future position j > i.
+        # 7) Causal mask: position i cannot see future position j > i.
         causal_mask = jnp.tril(jnp.ones((seqlen, seqlen), dtype=bool))
         scores = jnp.where(causal_mask[None, None, :, :], scores, -1e30)
 
-        # 7) Softmax over keys, then weighted sum of values.
+        # 8) Softmax over keys, then weighted sum of values.
         attn = jax.nn.softmax(scores, axis=-1)
         context = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
 
-        # 8) Merge heads and project to model space.
+        # 9) Merge heads and project to model space.
         context = jnp.transpose(context, (0, 2, 1, 3))
         context = jnp.reshape(
             context, (batch, seqlen, self.num_query_heads * self.head_dim)

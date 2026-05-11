@@ -237,10 +237,12 @@ class Mamba2Block(nnx.Module):
         # 5. D parameter — skip connection (like a residual from input to output)
         self.D = nnx.Param(jnp.ones((self.nheads,)))
 
-        # 6. Output normalization + projection
-        #    In the official code, RMSNormGated with norm_before_gate=False is used.
-        #    Here we use LayerNorm as a simple substitute (applied after gating).
-        self.norm = nnx.LayerNorm(self.d_inner, rngs=rngs)
+        # 6. Output normalization + projection.
+        #    The official Mamba-2 code uses RMSNormGated with norm_before_gate=False,
+        #    meaning: apply the gate (y * silu(z)) first, then normalize.
+        #    nnx.RMSNorm matches this: it has no bias term (unlike LayerNorm),
+        #    which is consistent with the paper's bias-free design.
+        self.norm = nnx.RMSNorm(self.d_inner, rngs=rngs)
         self.out_proj = nnx.Linear(
             self.d_inner, self.d_model, use_bias=False, rngs=rngs
         )

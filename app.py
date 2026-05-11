@@ -201,9 +201,34 @@ def total_training_loss(
     moe_aux_loss: jax.Array,
     moe_aux_loss_weight: float,
 ) -> jax.Array:
-    """Combines CE loss with MoE auxiliary load-balancing loss."""
+    """
+    Combines cross-entropy loss with the MoE auxiliary loss term.
+
+    With aux-loss-free load balancing, SparseMoE always returns jnp.zeros(())
+    for the aux loss, so this is effectively just cross-entropy. The weight
+    parameter and moe_aux_loss argument are kept for API compatibility.
+    """
     ce = cross_entropy_loss(logits, labels)
     return ce + moe_aux_loss_weight * moe_aux_loss
+
+
+def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
+    """
+    Update expert biases across every MoE layer after a training step.
+
+    This is the aux-loss-free load balancing step (Wang et al. 2024, §2.4).
+    Each MoE layer stored the top-k indices from its last forward pass in
+    `moe.last_topk_indices`. We read those indices here and call
+    `update_expert_bias`, which nudges each expert's bias by +/-bias_update_rate
+    depending on whether that expert was over- or under-utilized.
+
+    IMPORTANT: Call this AFTER optimizer.update, outside the gradient computation.
+    The expert_bias is an nnx.Variable (not nnx.Param) so the optimizer does
+    not touch it — it is updated only here.
+    """
+    for i in range(model.num_layers):
+        block = getattr(model, f"block_{i}")
+        block.moe.update_expert_bias(block.moe.last_topk_indices.value)
 
 
 def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
@@ -314,6 +339,11 @@ def train_model(
             loss_fn, has_aux=True
         )(model)
         optimizer.update(model, grads)
+
+        # Aux-loss-free load balancing: update expert biases AFTER the gradient step.
+        # Uses the top-k indices stored by each SparseMoE during the forward pass.
+        _update_all_expert_biases(model)
+
         return total_loss, ce_loss, moe_aux_loss
 
     print("\nTraining:")

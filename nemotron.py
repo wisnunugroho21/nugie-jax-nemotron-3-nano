@@ -17,7 +17,6 @@ What is intentionally simplified:
 - Tiny default dimensions for local experimentation
 - Alternating layer pattern instead of large paper-scale block scheduling
 - No distributed/expert-parallel optimization
-- Uses a simple auxiliary load-balancing loss (minimal implementation)
 """
 
 from dataclasses import dataclass, field

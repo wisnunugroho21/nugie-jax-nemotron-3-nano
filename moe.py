@@ -203,6 +203,14 @@ class SparseMoE(nnx.Module):
         # of gradient updates when extracting model parameters.
         self.expert_bias = nnx.Variable(jnp.zeros(self.num_routed_experts))
 
+        # Stores the top-k expert indices from the most recent forward pass.
+        # Shape at runtime: (num_tokens, routed_top_k). Placeholder shape here.
+        # After each training step, the training loop reads this to call
+        # update_expert_bias(self.last_topk_indices.value) — outside the gradient.
+        self.last_topk_indices = nnx.Variable(
+            jnp.zeros((1, self.routed_top_k), dtype=jnp.int32)
+        )
+
         # Router: a single linear layer mapping each token to one logit per routed expert.
         # No bias per paper. Shared experts are NOT routed — they bypass this.
         self.router = nnx.Linear(
@@ -382,6 +390,10 @@ class SparseMoE(nnx.Module):
         # We use biased scores here so the selection reflects the desired load balance.
         # topk_indices: (num_tokens, routed_top_k) — which expert indices were chosen
         _, topk_indices = jax.lax.top_k(biased_scores, self.routed_top_k)
+
+        # Save topk_indices so the training loop can call update_expert_bias()
+        # AFTER the optimizer step, outside the gradient computation.
+        self.last_topk_indices.value = topk_indices
 
         # Step 5: Build gate weights using the ORIGINAL (unbiased) sigmoid scores.
         # The bias only determines WHO gets selected, not HOW MUCH they contribute.
