@@ -334,9 +334,7 @@ class SparseMoE(nnx.Module):
             - self.bias_update_rate * jnp.sign(actual_count - expected_count)
         )
 
-    def __call__(
-        self, x: jax.Array, return_aux_loss: bool = False
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    def __call__(self, x: jax.Array) -> jax.Array:
         """
         Forward pass through the sparse MoE layer.
 
@@ -354,9 +352,6 @@ class SparseMoE(nnx.Module):
 
         Args:
             x: (batch, seqlen, d_model)
-            return_aux_loss: kept for API compatibility with nemotron.py.
-                             Always returns 0.0 — balancing is done via expert_bias,
-                             not a gradient loss term.
 
         Returns:
             y: (batch, seqlen, d_model)
@@ -377,7 +372,9 @@ class SparseMoE(nnx.Module):
         # Step 2: Apply sigmoid to get independent gate scores.
         # Unlike softmax, sigmoid does NOT create a probability distribution.
         # Each expert's score is judged independently — scores do not compete.
-        routed_scores = jax.nn.sigmoid(routed_logits)  # (num_tokens, num_routed_experts)
+        routed_scores = jax.nn.sigmoid(
+            routed_logits
+        )  # (num_tokens, num_routed_experts)
 
         # Step 3 (aux-loss-free): Add the expert bias to scores before top-k selection.
         # The bias is learned over time: underloaded experts accumulate a positive bias
@@ -438,8 +435,4 @@ class SparseMoE(nnx.Module):
         # Restore the original (batch, seqlen, d_model) shape.
         y = jnp.reshape(y_flat, (batch, seqlen, d_model))
 
-        if return_aux_loss:
-            # No gradient-based aux loss with aux-loss-free balancing.
-            # Load balancing is handled by update_expert_bias() called after training.
-            return y, jnp.zeros(())
         return y

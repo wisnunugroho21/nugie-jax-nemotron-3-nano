@@ -315,9 +315,14 @@ def train_model(
     """Runs a tiny training loop and prints readable metrics."""
 
     @nnx.jit
-    def train_step(model, optimizer, x_batch, y_batch):
-        def loss_fn(model):
-            logits_local = model(x_batch, return_aux_loss=False)
+    def train_step(
+        model: NemotronNanoBlock,
+        optimizer: nnx.Optimizer,
+        x_batch: jax.Array,
+        y_batch: jax.Array,
+    ) -> jax.Array:
+        def loss_fn(model: NemotronNanoBlock) -> jax.Array:
+            logits_local = model(x_batch)
             return total_training_loss(logits=logits_local, labels=y_batch)
 
         total_loss, grads = nnx.value_and_grad(loss_fn)(model)
@@ -363,7 +368,7 @@ def evaluate_model(
     for _ in range(eval_batches):
         rng_key, batch_key = jax.random.split(rng_key)
         x_batch, y_batch = sample_lm_batch(val_tokens, batch_size, seq_len, batch_key)
-        logits = model(x_batch, return_aux_loss=False)
+        logits = model(x_batch)
         ce = cross_entropy_loss(logits, y_batch)
         total = ce
 
@@ -489,7 +494,10 @@ def chat_loop(
         # Keep only recent history so context stays bounded and simple.
         history = history[-1200:]
 
-def create_lr_schedule(max_steps: int, warmup_steps: int, peak_lr: float) -> optax.Schedule:
+
+def create_lr_schedule(
+    max_steps: int, warmup_steps: int, peak_lr: float
+) -> optax.Schedule:
     """
     Creates a two-phase learning rate schedule:
       Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
@@ -511,6 +519,7 @@ def create_lr_schedule(max_steps: int, warmup_steps: int, peak_lr: float) -> opt
         schedules=[warmup, decay],
         boundaries=[warmup_steps],
     )
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """CLI arguments kept intentionally small and beginner-friendly."""

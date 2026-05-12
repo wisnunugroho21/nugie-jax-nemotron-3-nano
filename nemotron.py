@@ -22,14 +22,11 @@ What is intentionally simplified:
 from dataclasses import dataclass, field
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 
 from attention import GroupedQueryAttention
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
-
-BlockOutput = jax.Array | tuple[jax.Array, jax.Array]
 
 
 def _default_patterns() -> list[tuple[str, int]]:
@@ -213,25 +210,6 @@ def _build_moe(config: NemotronConfig, rngs: nnx.Rngs) -> SparseMoE:
     )
 
 
-def _apply_moe_residual(
-    x: jax.Array,
-    norm_moe: nnx.RMSNorm,
-    moe: SparseMoE,
-    return_aux_loss: bool,
-) -> BlockOutput:
-    # Keep aux-loss semantics identical across all block variants.
-    if return_aux_loss:
-        moe_out, moe_aux_loss = moe(norm_moe(x), return_aux_loss=True)
-        x = x + moe_out
-        return x, moe_aux_loss
-
-    moe_out = moe(norm_moe(x), return_aux_loss=False)
-    if isinstance(moe_out, tuple):
-        raise RuntimeError("Expected SparseMoE to return only tensor output")
-    x = x + moe_out
-    return x
-
-
 class MambaMoEBlock(nnx.Module):
     """
     Hybrid Mamba & MoE block.
@@ -253,17 +231,12 @@ class MambaMoEBlock(nnx.Module):
         # MoE stage after every mixer layer.
         self.moe = _build_moe(config=config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> BlockOutput:
+    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> jax.Array:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
         # MoE residual path.
-        return _apply_moe_residual(
-            x=x,
-            norm_moe=self.norm_moe,
-            moe=self.moe,
-            return_aux_loss=return_aux_loss,
-        )
+        return x + self.moe(self.norm_moe(x))
 
 
 class MambaAttentionMoEBlock(nnx.Module):
@@ -298,7 +271,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         # MoE stage after every mixer layer.
         self.moe = _build_moe(config=config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> BlockOutput:
+    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> jax.Array:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
@@ -306,12 +279,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         x = x + self.attention(self.norm_attention(x))
 
         # MoE residual path.
-        return _apply_moe_residual(
-            x=x,
-            norm_moe=self.norm_moe,
-            moe=self.moe,
-            return_aux_loss=return_aux_loss,
-        )
+        return x + self.moe(self.norm_moe(x))
 
 
 class NemotronNanoBlock(nnx.Module):
@@ -358,24 +326,14 @@ class NemotronNanoBlock(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(
-        self, token_ids: jax.Array, return_aux_loss: bool = False
-    ) -> BlockOutput:
+    def __call__(self, token_ids: jax.Array) -> jax.Array:
         x = self.embedding(token_ids)
-        total_aux_loss = jnp.array(0.0, dtype=jnp.float32)
 
         for i in range(self.num_layers):
             block = getattr(self, f"block_{i}")
-            if return_aux_loss:
-                x, block_aux_loss = block(x, return_aux_loss=True)
-                total_aux_loss = total_aux_loss + block_aux_loss
-            else:
-                x = block(x)
+            x = block(x)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
-        if return_aux_loss:
-            # Average over blocks to keep scale more stable across depth.
-            total_aux_loss = total_aux_loss / self.num_layers
-            return logits, total_aux_loss
+
         return logits
