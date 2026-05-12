@@ -231,7 +231,7 @@ class MambaMoEBlock(nnx.Module):
         # MoE stage after every mixer layer.
         self.moe = _build_moe(config=config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> jax.Array:
+    def __call__(self, x: jax.Array) -> jax.Array:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
@@ -271,7 +271,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         # MoE stage after every mixer layer.
         self.moe = _build_moe(config=config, rngs=rngs)
 
-    def __call__(self, x: jax.Array, return_aux_loss: bool = False) -> jax.Array:
+    def __call__(self, x: jax.Array) -> jax.Array:
         # Mamba residual path.
         x = x + self.mamba(self.norm_mamba(x))
 
