@@ -362,13 +362,17 @@ def prepare_datasets(
     assistant_role_tag: str = "<|assistant|>",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """
-    Creates train/val token streams from TinyStories text.
+    Creates train/val token streams from a list of text samples.
+
+    Works with both plain text (TinyStories) and role-tagged chat text (JSONL).
+    When assistant_only_loss=True, also computes a per-token loss mask that
+    marks only assistant content as supervised.
 
     Output format:
     - train_tokens: shape (num_train_tokens,)
     - val_tokens: shape (num_val_tokens,)
-    - train_loss_mask: shape (num_train_tokens,)
-    - val_loss_mask: shape (num_val_tokens,)
+    - train_loss_mask: shape (num_train_tokens,)  — all 1.0 when masking is off
+    - val_loss_mask: shape (num_val_tokens,)      — all 1.0 when masking is off
     """
     if not train_texts or not val_texts:
         raise ValueError("train_texts and val_texts must both be non-empty")

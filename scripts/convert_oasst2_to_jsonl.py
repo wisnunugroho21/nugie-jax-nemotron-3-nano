@@ -59,7 +59,9 @@ def _stable_hash_fraction(text: str) -> float:
     """Map a string deterministically to [0, 1) for split assignment."""
     digest = hashlib.md5(text.encode("utf-8")).hexdigest()
     value = int(digest[:8], 16)
-    return value / float(0xFFFFFFFF)
+    # Divide by 2**32 so the range is [0, 1) — 0xFFFFFFFF+1 ensures the
+    # maximum 32-bit value never maps to exactly 1.0.
+    return value / 0x100000000
 
 
 def _get_field(row: dict[str, Any], keys: tuple[str, ...]) -> Any:

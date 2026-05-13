@@ -219,17 +219,19 @@ Edit hyperparameters in `app.py` or pass via CLI arguments:
 ```python
 # Key config variables (from nemotron.NemotronConfig)
 config = NemotronConfig(
-   vocab_size=...,              # Set from len(hf_tokenizer)
-    max_seq_len=256,             # Maximum sequence length
-    d_model=128,                 # Embedding dimension
-    n_layers=7,                  # Number of hybrid blocks
-    layer_pattern=[...],         # Mamba/Attention/MoE scheduling
-    mamba_d_state=16,            # Mamba state size
-    num_heads=4,                 # Attention heads
-    num_kv_heads=2,              # KV heads (grouped query)
-    moe_num_experts=4,           # Number of routed experts
-    moe_top_k=2,                 # Select top-2 experts
-    moe_expert_hidden_dim=256,   # Expert FFN hidden size
+    vocab_size=...,                  # Set from len(hf_tokenizer)
+    d_model=128,                     # Embedding dimension
+    patterns=[...],                  # List of (block_type, repeats) tuples
+    num_attention_heads=4,           # Query heads in GQA
+    num_kv_heads=1,                  # KV heads (grouped query)
+    attention_head_dim=32,           # Per-head dimension
+    mamba_d_state=64,                # Mamba SSM state size
+    mamba_chunk_size=64,             # Mamba chunk size (seq_len must be divisible)
+    num_experts=4,                   # Number of routed MoE experts
+    top_k=2,                         # Top-k experts selected per token
+    expert_hidden_dim=256,           # Expert FFN hidden dimension
+    num_shared_experts=1,            # Always-on shared experts
+    granularity_factor=1,            # Expert granularity splitting factor
 )
 ```
 
