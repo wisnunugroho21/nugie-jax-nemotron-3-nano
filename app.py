@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 import math
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -91,10 +91,11 @@ def _get_special_token_ids(tokenizer: "PreTrainedTokenizerBase") -> tuple[int, i
         raise ValueError("Tokenizer must define pad_token_id, bos_token_id, eos_token_id")
 
     return (
-        cast(int, tokenizer.pad_token_id),
-        cast(int, tokenizer.bos_token_id),
-        cast(int, tokenizer.eos_token_id),
+        int(tokenizer.pad_token_id),  # type: ignore[arg-type]
+        int(tokenizer.bos_token_id),  # type: ignore[arg-type]
+        int(tokenizer.eos_token_id),  # type: ignore[arg-type]
     )
+
 
 def encode_text(
     tokenizer: "PreTrainedTokenizerBase",
@@ -454,7 +455,7 @@ def generate_reply(
         generated_ids.append(next_id)
 
     decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return cast(str, decoded), rng_key
+    return str(decoded), rng_key
 
 
 def chat_loop(
