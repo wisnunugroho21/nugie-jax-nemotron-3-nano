@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from typing import TYPE_CHECKING, cast
 
 import jax
 import jax.numpy as jnp
@@ -25,75 +26,91 @@ from flax import nnx
 
 from nemotron import NemotronConfig, NemotronNanoBlock
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
-class CharTokenizer:
+def load_hf_tokenizer(
+    tokenizer_name: str,
+    cache_dir: str | None = None,
+) -> "PreTrainedTokenizerBase":
     """
-    Very small character-level tokenizer.
+    Loads a tokenizer from Hugging Face and guarantees core special tokens.
 
-    Why character-level?
-    - It is the simplest reversible tokenizer.
-    - It is easy to explain and debug.
-    - It avoids extra external dependencies.
+    We ensure PAD/BOS/EOS IDs exist because batching and generation rely on them.
     """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise ImportError(
+            "Hugging Face tokenizer support requires the 'transformers' package. "
+            "Install it with: pip install transformers"
+        ) from exc
 
-    def __init__(self) -> None:
-        # Reserve a few special IDs that help batching/generation.
-        self.special_tokens = ["<pad>", "<bos>", "<eos>"]
-        self.token_to_id: dict[str, int] = {}
-        self.id_to_token: dict[int, str] = {}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            cache_dir=cache_dir,
+            use_fast=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load Hugging Face tokenizer '{tokenizer_name}'."
+        ) from exc
 
-    def fit(self, texts: list[str]) -> None:
-        """Builds a vocabulary from all unique characters in the corpus."""
-        charset: set[str] = set()
-        for text in texts:
-            charset.update(text)
+    # Generation depends on EOS.
+    if tokenizer.eos_token_id is None:
+        if tokenizer.sep_token is not None:
+            tokenizer.eos_token = tokenizer.sep_token
+        else:
+            tokenizer.add_special_tokens({"eos_token": "<eos>"})
 
-        # Keep character order deterministic by sorting.
-        vocab = self.special_tokens + sorted(charset)
-        self.token_to_id = {token: idx for idx, token in enumerate(vocab)}
-        self.id_to_token = {idx: token for token, idx in self.token_to_id.items()}
+    # We use BOS as a light conversation delimiter.
+    if tokenizer.bos_token_id is None:
+        if tokenizer.cls_token is not None:
+            tokenizer.bos_token = tokenizer.cls_token
+        else:
+            tokenizer.add_special_tokens({"bos_token": "<bos>"})
 
-    @property
-    def pad_id(self) -> int:
-        return self.token_to_id["<pad>"]
+    # Left padding is used for fixed-length context windows.
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
-    @property
-    def bos_id(self) -> int:
-        return self.token_to_id["<bos>"]
+    return tokenizer
 
-    @property
-    def eos_id(self) -> int:
-        return self.token_to_id["<eos>"]
 
-    @property
-    def vocab_size(self) -> int:
-        return len(self.token_to_id)
+def _get_special_token_ids(tokenizer: "PreTrainedTokenizerBase") -> tuple[int, int, int]:
+    """Returns guaranteed integer IDs for PAD/BOS/EOS tokens."""
+    if (
+        tokenizer.pad_token_id is None
+        or tokenizer.bos_token_id is None
+        or tokenizer.eos_token_id is None
+    ):
+        raise ValueError("Tokenizer must define pad_token_id, bos_token_id, eos_token_id")
 
-    def encode(
-        self, text: str, add_bos: bool = False, add_eos: bool = False
-    ) -> list[int]:
-        """Converts text to token IDs."""
-        ids: list[int] = []
-        if add_bos:
-            ids.append(self.bos_id)
+    return (
+        cast(int, tokenizer.pad_token_id),
+        cast(int, tokenizer.bos_token_id),
+        cast(int, tokenizer.eos_token_id),
+    )
 
-        for ch in text:
-            if ch in self.token_to_id:
-                ids.append(self.token_to_id[ch])
+def encode_text(
+    tokenizer: "PreTrainedTokenizerBase",
+    text: str,
+    add_bos: bool = False,
+    add_eos: bool = False,
+) -> list[int]:
+    """Encodes text and optionally prepends/appends BOS/EOS."""
+    _, bos_id, eos_id = _get_special_token_ids(tokenizer)
 
-        if add_eos:
-            ids.append(self.eos_id)
-        return ids
-
-    def decode(self, ids: list[int], skip_special: bool = True) -> str:
-        """Converts token IDs back to text."""
-        chars: list[str] = []
-        for idx in ids:
-            token = self.id_to_token.get(int(idx), "")
-            if skip_special and token in self.special_tokens:
-                continue
-            chars.append(token)
-        return "".join(chars)
+    ids = list(tokenizer.encode(text, add_special_tokens=False))
+    if add_bos:
+        ids = [bos_id] + ids
+    if add_eos:
+        ids = ids + [eos_id]
+    return ids
 
 
 def _extract_story_text(example: dict[str, object]) -> str:
@@ -210,7 +227,7 @@ def _update_all_expert_biases(model: NemotronNanoBlock) -> None:
     not touch it — it is updated only here.
     """
     for block in model.blocks:
-        block.moe.update_expert_bias(block.moe.last_topk_indices.value)
+        block.moe.update_expert_bias(block.moe.last_topk_indices[...])
 
 
 def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
@@ -227,7 +244,7 @@ def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
 
 
 def prepare_datasets(
-    tokenizer: CharTokenizer,
+    tokenizer: "PreTrainedTokenizerBase",
     train_texts: list[str],
     val_texts: list[str],
     seq_len: int,
@@ -247,8 +264,8 @@ def prepare_datasets(
     val_joined = "\n\n".join(val_texts)
 
     # Add BOS/EOS so the model can learn sequence boundaries.
-    train_ids = tokenizer.encode(train_joined, add_bos=True, add_eos=True)
-    val_ids = tokenizer.encode(val_joined, add_bos=True, add_eos=True)
+    train_ids = encode_text(tokenizer, train_joined, add_bos=True, add_eos=True)
+    val_ids = encode_text(tokenizer, val_joined, add_bos=True, add_eos=True)
 
     train_tokens = jnp.array(train_ids, dtype=jnp.int32)
     val_tokens = jnp.array(val_ids, dtype=jnp.int32)
@@ -401,7 +418,7 @@ def sample_next_token(
 
 def generate_reply(
     model: NemotronNanoBlock,
-    tokenizer: CharTokenizer,
+    tokenizer: "PreTrainedTokenizerBase",
     prompt_text: str,
     seq_len: int,
     max_new_tokens: int,
@@ -409,34 +426,40 @@ def generate_reply(
     rng_key: jax.Array,
 ) -> tuple[str, jax.Array]:
     """Autoregressively generates assistant text from a prompt."""
-    context_ids = tokenizer.encode(prompt_text, add_bos=True, add_eos=False)
+    pad_id, bos_id, eos_id = _get_special_token_ids(tokenizer)
+
+    context_ids = encode_text(tokenizer, prompt_text, add_bos=True, add_eos=False)
     generated_ids: list[int] = []
 
     for _ in range(max_new_tokens):
-        model_input = pad_or_trim_context(context_ids, seq_len, tokenizer.pad_id)
+        model_input = pad_or_trim_context(context_ids, seq_len, pad_id)
         logits = model(model_input)
 
         next_logits = logits[0, -1]
 
-        # Avoid sampling these two control tokens during response generation.
-        next_logits = next_logits.at[tokenizer.pad_id].set(-1e9)
-        next_logits = next_logits.at[tokenizer.bos_id].set(-1e9)
+        # Avoid sampling control tokens during response generation.
+        # Some tokenizers reuse eos as pad, so guard against masking eos by accident.
+        if pad_id != eos_id:
+            next_logits = next_logits.at[pad_id].set(-1e9)
+        if bos_id != eos_id and bos_id != pad_id:
+            next_logits = next_logits.at[bos_id].set(-1e9)
 
         rng_key, sample_key = jax.random.split(rng_key)
         next_id = sample_next_token(next_logits, temperature, sample_key)
 
-        if next_id == tokenizer.eos_id:
+        if next_id == eos_id:
             break
 
         context_ids.append(next_id)
         generated_ids.append(next_id)
 
-    return tokenizer.decode(generated_ids, skip_special=True), rng_key
+    decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return cast(str, decoded), rng_key
 
 
 def chat_loop(
     model: NemotronNanoBlock,
-    tokenizer: CharTokenizer,
+    tokenizer: "PreTrainedTokenizerBase",
     seq_len: int,
     temperature: float,
     max_new_tokens: int,
@@ -553,6 +576,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional Hugging Face cache directory",
     )
     parser.add_argument(
+        "--tokenizer-name",
+        type=str,
+        default="google/byt5-small",
+        help="Hugging Face tokenizer name or local path",
+    )
+    parser.add_argument(
+        "--tokenizer-cache-dir",
+        type=str,
+        default=None,
+        help="Optional Hugging Face cache directory for tokenizer files",
+    )
+    parser.add_argument(
         "--preview-first-story",
         action="store_true",
         help="Print a short preview of the first loaded TinyStories sample",
@@ -605,14 +640,16 @@ def main() -> None:
         print("\nTinyStories preview (first loaded sample):")
         print(f"  {preview}")
 
-    # 2) Build tokenizer from dataset text.
-    # We fit on all loaded stories so train and validation text are always encodable.
-    tokenizer = CharTokenizer()
-    tokenizer.fit(all_stories)
+    # 2) Load Hugging Face tokenizer.
+    tokenizer = load_hf_tokenizer(
+        tokenizer_name=args.tokenizer_name,
+        cache_dir=args.tokenizer_cache_dir,
+    )
 
     # 3) Build Nemotron config/model.
     config = NemotronConfig.from_preset(args.preset)
-    config.vocab_size = tokenizer.vocab_size
+    # len(tokenizer) includes any runtime-added special tokens.
+    config.vocab_size = len(tokenizer)
 
     if args.seq_len % config.mamba_chunk_size != 0:
         raise ValueError(
@@ -621,7 +658,8 @@ def main() -> None:
 
     print(
         "Model setup: "
-        f"preset={args.preset}, vocab_size={config.vocab_size}, "
+        f"preset={args.preset}, tokenizer={args.tokenizer_name}, "
+        f"vocab_size={config.vocab_size}, "
         f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
     )
 

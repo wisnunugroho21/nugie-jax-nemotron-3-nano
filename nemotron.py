@@ -310,7 +310,7 @@ class NemotronNanoBlock(nnx.Module):
                 raise ValueError(f"Unknown block type '{block_type}'")
             for _ in range(repeats):
                 blocks.append(block_factory(config=config, rngs=rngs))
-        self.blocks = blocks
+        self.blocks = nnx.List(blocks)
 
         self.final_norm = nnx.RMSNorm(config.d_model, rngs=rngs)
 

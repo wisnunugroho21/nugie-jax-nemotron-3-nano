@@ -60,6 +60,7 @@ Each mixer is followed by a **Sparse Mixture-of-Experts (MoE)** layer.
 - Flax
 - Optax (for optimization)
 - Datasets (for TinyStories dataset)
+- Transformers (for Hugging Face tokenizers)
 
 ### Setup
 
@@ -74,7 +75,7 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt  # If available
 # Or manually:
-pip install jax flax optax datasets
+pip install jax flax optax datasets transformers
 ```
 
 ---
@@ -87,18 +88,19 @@ Run the full pipeline (load data → train → evaluate → chat):
 
 ```bash
 python app.py \
-  --epochs 3 \
-  --batch_size 32 \
-  --learning_rate 1e-3 \
-  --max_seq_len 256
+   --steps 80 \
+   --batch-size 8 \
+   --seq-len 64 \
+   --tokenizer-name google/byt5-small
 ```
 
 **What happens in `app.py`:**
 
-1. **Data Loading**: Loads TinyStories dataset (character-level tokenization)
-2. **Model Training**: Trains the Nemotron model with validation loss tracking
-3. **Evaluation**: Computes validation perplexity
-4. **Interactive Chat**: Generates text from prompts in the terminal
+1. **Data Loading**: Loads TinyStories dataset
+2. **Tokenization**: Uses a Hugging Face tokenizer (default: `google/byt5-small`)
+3. **Model Training**: Trains the Nemotron model with validation loss tracking
+4. **Evaluation**: Computes validation perplexity
+5. **Interactive Chat**: Generates text from prompts in the terminal
 
 ### Checkpointing
 
@@ -110,13 +112,16 @@ checkpoints/
 └── ...
 ```
 
-### Character-Level Tokenizer
+### Hugging Face Tokenizer
 
-The project uses a **simple character-level tokenizer** (`CharTokenizer` in `app.py`):
-- ✅ Reversible (no information loss)
-- ✅ Easy to debug and visualize
-- ✅ No external dependencies
-- ❌ Not efficient for large models (use BPE/SentencePiece for production)
+The project now uses a tokenizer loaded from Hugging Face (`AutoTokenizer` in `app.py`).
+
+- Default tokenizer: `google/byt5-small`
+- Override with: `--tokenizer-name <model-or-path>`
+- Optional cache: `--tokenizer-cache-dir <path>`
+
+Special token behavior is normalized in code so batching and generation always
+have PAD/BOS/EOS IDs available.
 
 ---
 
@@ -144,7 +149,7 @@ Edit hyperparameters in `app.py` or pass via CLI arguments:
 ```python
 # Key config variables (from nemotron.NemotronConfig)
 config = NemotronConfig(
-    vocab_size=256,              # Character-level vocabulary
+   vocab_size=...,              # Set from len(hf_tokenizer)
     max_seq_len=256,             # Maximum sequence length
     d_model=128,                 # Embedding dimension
     n_layers=7,                  # Number of hybrid blocks
