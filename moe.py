@@ -242,8 +242,8 @@ class SparseMoE(nnx.Module):
         # Weights are pre-stacked at init time — no assembly cost here.
         # W1: (num_routed_experts, d_model,      routed_expert_hidden_dim)
         # W2: (num_routed_experts, routed_expert_hidden_dim, d_model)
-        W1 = self.routed_W1.value
-        W2 = self.routed_W2.value
+        W1 = self.routed_W1.get_value()
+        W2 = self.routed_W2.get_value()
 
         # Gather only the weights of each token's top-k selected experts.
         # topk_indices: (num_tokens, routed_top_k)  →  index into axis-0 of W1/W2
@@ -287,13 +287,13 @@ class SparseMoE(nnx.Module):
         # All shared experts run in one batched einsum — no sequential loop.
         # 'td,edh->teh': for each of the E shared experts, project every token
         # from d_model up to shared_expert_hidden_dim simultaneously.
-        h = jnp.einsum("td,edh->teh", x_flat, self.shared_W1.value)
+        h = jnp.einsum("td,edh->teh", x_flat, self.shared_W1.get_value())
         # Squared-ReLU: relu(x)^2 — same activation as the routed experts.
         h = jax.nn.relu(h)
         h = h * h
         # 'teh,ehd->ted': project all shared expert hidden states back to d_model.
         # out: (num_tokens, num_shared_experts, d_model)
-        return jnp.einsum("teh,ehd->ted", h, self.shared_W2.value)
+        return jnp.einsum("teh,ehd->ted", h, self.shared_W2.get_value())
 
     def update_expert_bias(self, topk_indices: jax.Array) -> None:
         """
@@ -337,8 +337,8 @@ class SparseMoE(nnx.Module):
         #   +1 means overloaded  → subtract from bias → harder to pick next time
         #   -1 means underloaded → add to bias        → easier to pick next time
         #    0 means perfect     → no change
-        self.expert_bias.value = (
-            self.expert_bias.value
+        self.expert_bias.set_value(
+            self.expert_bias.get_value()
             - self.bias_update_rate * jnp.sign(actual_count - expected_count)
         )
 
@@ -389,7 +389,7 @@ class SparseMoE(nnx.Module):
         # (making them easier to pick), overloaded experts accumulate a negative bias
         # (making them harder to pick). This is the key load-balancing mechanism.
         # expert_bias shape: (num_routed_experts,) → broadcasts across all tokens.
-        biased_scores = routed_scores + self.expert_bias.value
+        biased_scores = routed_scores + self.expert_bias.get_value()
 
         # Step 4: Select top-k experts using BIASED scores.
         # We use biased scores here so the selection reflects the desired load balance.
@@ -398,7 +398,7 @@ class SparseMoE(nnx.Module):
 
         # Save topk_indices so the training loop can call update_expert_bias()
         # AFTER the optimizer step, outside the gradient computation.
-        self.last_topk_indices.value = topk_indices
+        self.last_topk_indices.set_value(topk_indices)
 
         # Step 5: Build gate weights using the ORIGINAL (unbiased) sigmoid scores.
         # The bias only determines WHO gets selected, not HOW MUCH they contribute.

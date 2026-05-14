@@ -273,7 +273,7 @@ class Mamba2Block(nnx.Module):
         # dt:  (batch, seqlen, nheads)      — per-head step sizes
 
         # Apply softplus to dt (ensures positive step sizes)
-        dt = jax.nn.softplus(dt + self.dt_bias.value)  # (batch, seqlen, nheads)
+        dt = jax.nn.softplus(dt + self.dt_bias.get_value())  # (batch, seqlen, nheads)
 
         # --- 2. Causal 1D Convolution ---
         # Pad on the left for causal masking: output at time t only sees t-d_conv+1..t
@@ -305,7 +305,7 @@ class Mamba2Block(nnx.Module):
 
         # --- 3. SSD Core Computation ---
         # Continuous-time A: always negative (ensures decay/stability)
-        A = -jnp.exp(self.A_log.value)  # (nheads,)
+        A = -jnp.exp(self.A_log.get_value())  # (nheads,)
 
         # Discretize: multiply by step size dt
         # This converts continuous A to discrete A_bar = exp(A * dt)
@@ -317,7 +317,7 @@ class Mamba2Block(nnx.Module):
         y = ssd_minimal_discrete(X, A_discrete, B, C, self.chunk_size)
 
         # Add D skip connection: D * x (direct input-to-output path)
-        y = y + self.D.value[None, None, :, None] * x
+        y = y + self.D.get_value()[None, None, :, None] * x
 
         # Flatten heads back to d_inner
         y = jnp.reshape(y, (batch, seqlen, self.d_inner))
