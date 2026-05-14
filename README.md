@@ -223,14 +223,30 @@ have PAD/BOS/EOS IDs available.
 nugie-jax-nemotron/
 ├── app.py              # Training loop, evaluation, interactive chat
 ├── nemotron.py         # Main model architecture (config + hybrid layers)
+├── nemotron_multimodal.py  # Multimodal adapter wrapper (vision + optional action head)
 ├── attention.py        # Grouped-Query Attention (GQA) implementation
 ├── mamba_2.py          # Mamba 2 State-Space Model blocks
 ├── moe.py              # Sparse Mixture-of-Experts implementation
+├── vision_encoder.py   # Lightweight patch-based vision token encoder
+├── task_router.py      # Hybrid text/action loss helpers for VLM/VLA training
 ├── checkpoints/        # Saved model weights (.npz files)
 ├── data/               # Training datasets (TinyStories)
 ├── LICENSE             # Apache 2.0
 └── README.md           # This file
 ```
+
+### Multimodal Adapter (Work In Progress)
+
+The repository now includes an early multimodal adapter path:
+
+- `--model-mode text` keeps the original text-only behavior.
+- `--model-mode vlm` builds the multimodal model with vision modules enabled.
+- `--model-mode vla` also enables an action head.
+
+Current status:
+- Core multimodal modules are implemented and importable.
+- The default training loop still optimizes language-model loss.
+- Full VLA action-loss training wiring is planned as a next step.
 
 ---
 

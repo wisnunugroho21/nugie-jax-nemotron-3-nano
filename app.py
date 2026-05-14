@@ -28,6 +28,7 @@ import optax
 from flax import nnx
 
 from nemotron import NemotronConfig, NemotronNanoBlock
+from nemotron_multimodal import NemotronMultimodal, NemotronMultimodalConfig
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -814,8 +815,9 @@ def chat_loop(
 
 
 def load_checkpoint_into_model(
-    model: NemotronNanoBlock,
+    model: NemotronNanoBlock | NemotronMultimodal,
     checkpoint_path: str,
+    strict: bool = True,
 ) -> int:
     """
     Loads model parameter leaves from a legacy .npz checkpoint.
@@ -851,32 +853,38 @@ def load_checkpoint_into_model(
 
         ckpt_leaves = [jnp.asarray(ckpt[key]) for key in ordered_keys]
 
-    if len(ckpt_leaves) != len(param_leaves):
+    if strict and len(ckpt_leaves) != len(param_leaves):
         raise ValueError(
             "Checkpoint parameter count mismatch: "
             f"checkpoint has {len(ckpt_leaves)} leaves, "
             f"model expects {len(param_leaves)} leaves"
         )
 
-    restored_leaves: list[jax.Array] = []
-    for leaf_index, (target_leaf, source_leaf) in enumerate(
-        zip(param_leaves, ckpt_leaves)
-    ):
-        target_arr = jnp.asarray(target_leaf)
+    restored_leaves: list[jax.Array] = [jnp.asarray(leaf) for leaf in param_leaves]
+    pair_count = min(len(param_leaves), len(ckpt_leaves))
+
+    restored_count = 0
+    for leaf_index in range(pair_count):
+        target_arr = jnp.asarray(param_leaves[leaf_index])
+        source_leaf = ckpt_leaves[leaf_index]
+
         if target_arr.shape != source_leaf.shape:
-            raise ValueError(
-                "Checkpoint shape mismatch at leaf "
-                f"{leaf_index}: checkpoint {source_leaf.shape} vs model {target_arr.shape}"
-            )
+            if strict:
+                raise ValueError(
+                    "Checkpoint shape mismatch at leaf "
+                    f"{leaf_index}: checkpoint {source_leaf.shape} vs model {target_arr.shape}"
+                )
+            continue
 
         if source_leaf.dtype != target_arr.dtype:
             source_leaf = source_leaf.astype(target_arr.dtype)
 
-        restored_leaves.append(source_leaf)
+        restored_leaves[leaf_index] = source_leaf
+        restored_count += 1
 
     restored_params = jax.tree_util.tree_unflatten(tree_def, restored_leaves)
     nnx.update(model, restored_params)
-    return len(restored_leaves)
+    return restored_count
 
 
 # =============================================================================
@@ -888,6 +896,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """CLI arguments kept intentionally small and beginner-friendly."""
     parser = argparse.ArgumentParser(description="Minimal Nemotron train/eval/chat app")
     parser.add_argument("--preset", type=str, default="tiny", help="Nemotron preset")
+    parser.add_argument(
+        "--model-mode",
+        type=str,
+        default="text",
+        choices=["text", "vlm", "vla"],
+        help="Run mode: text-only Nemotron, vision-language (vlm), or vision-language-action (vla)",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=224,
+        help="Input image size for multimodal mode",
+    )
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=16,
+        help="Vision patch size for multimodal mode",
+    )
+    parser.add_argument(
+        "--vision-dim",
+        type=int,
+        default=256,
+        help="Intermediate vision embedding dimension before projection to d_model",
+    )
+    parser.add_argument(
+        "--vision-fusion",
+        type=str,
+        default="prepend",
+        choices=["prepend", "append"],
+        help="How vision tokens are fused with text tokens in multimodal mode",
+    )
+    parser.add_argument(
+        "--action-vocab-size",
+        type=int,
+        default=256,
+        help="Action vocabulary size used when --model-mode=vla",
+    )
     parser.add_argument("--steps", type=int, default=80, help="Training steps")
     parser.add_argument(
         "--batch-size", type=int, default=8, help="Train/eval batch size"
@@ -1006,6 +1052,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to .npz checkpoint with model parameter leaves",
     )
     parser.add_argument(
+        "--checkpoint-non-strict",
+        action="store_true",
+        help="Allow partial checkpoint loading by skipping mismatched parameter leaves",
+    )
+    parser.add_argument(
         "--assistant-only-loss",
         action="store_true",
         help=(
@@ -1074,25 +1125,52 @@ def main() -> None:
         cache_dir=args.tokenizer_cache_dir,
     )
 
-    # 2) Build Nemotron config/model.
-    config = NemotronConfig.from_preset(args.preset)
+    # 2) Build config/model.
+    base_config = NemotronConfig.from_preset(args.preset)
     # len(tokenizer) includes any runtime-added special tokens.
-    config.vocab_size = len(tokenizer)
+    base_config.vocab_size = len(tokenizer)
 
-    if args.seq_len % config.mamba_chunk_size != 0:
+    if args.seq_len % base_config.mamba_chunk_size != 0:
         raise ValueError(
-            f"seq_len must be divisible by mamba_chunk_size ({config.mamba_chunk_size})"
+            f"seq_len must be divisible by mamba_chunk_size ({base_config.mamba_chunk_size})"
         )
 
     print(
         "Model setup: "
-        f"preset={args.preset}, tokenizer={args.tokenizer_name}, "
-        f"vocab_size={config.vocab_size}, "
-        f"seq_len={args.seq_len}, chunk_size={config.mamba_chunk_size}"
+        f"mode={args.model_mode}, preset={args.preset}, tokenizer={args.tokenizer_name}, "
+        f"vocab_size={base_config.vocab_size}, "
+        f"seq_len={args.seq_len}, chunk_size={base_config.mamba_chunk_size}"
     )
 
     rngs = nnx.Rngs(args.seed)
-    model = NemotronNanoBlock(rngs=rngs, config=config)
+    model: NemotronNanoBlock | NemotronMultimodal
+
+    if args.model_mode == "text":
+        model = NemotronNanoBlock(rngs=rngs, config=base_config)
+    else:
+        mm_config = NemotronMultimodalConfig(
+            **vars(base_config),
+            use_vision=True,
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            vision_dim=args.vision_dim,
+            vision_fusion=args.vision_fusion,
+            use_action_head=(args.model_mode == "vla"),
+            action_vocab_size=args.action_vocab_size,
+        )
+        model = NemotronMultimodal(rngs=rngs, config=mm_config)
+
+        print(
+            "Multimodal adapter enabled: "
+            f"vision={mm_config.use_vision}, "
+            f"fusion={mm_config.vision_fusion}, "
+            f"action_head={mm_config.use_action_head}"
+        )
+        if args.model_mode == "vla":
+            print(
+                "Note: VLA action-loss training is not wired into the default "
+                "train loop yet; current run uses language-model loss only."
+            )
 
     # Chat-only mode: load checkpoint and jump straight to interactive chat.
     if args.chat_only:
@@ -1102,6 +1180,7 @@ def main() -> None:
         restored_count = load_checkpoint_into_model(
             model=model,
             checkpoint_path=args.checkpoint_path,
+            strict=not args.checkpoint_non_strict,
         )
         print(
             f"Loaded checkpoint '{args.checkpoint_path}' "
