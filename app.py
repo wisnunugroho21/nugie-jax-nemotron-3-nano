@@ -2,7 +2,7 @@
 Simple, minimal, and explainable Nemotron app.
 
 This script shows a full small workflow:
-1) Load a conversational JSONL dataset
+1) Load open-thoughts/OpenThoughts-114k directly from Hugging Face
 2) Train a tiny Nemotron language model
 3) Evaluate it with validation loss + perplexity
 4) Chat with it in the terminal
@@ -16,8 +16,9 @@ Design goals:
 from __future__ import annotations
 
 import argparse
-import json
+import hashlib
 import math
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -241,57 +242,166 @@ def encode_text_with_assistant_mask(
 
 
 # =============================================================================
-# Dataset (JSONL conversational text)
+# Dataset helpers
 # =============================================================================
 
 
-def load_jsonl_texts(
-    jsonl_path: str,
-    max_records: int,
-    text_key: str = "serialized_text",
-) -> list[str]:
+def _normalize_text(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _serialize_turns(
+    turns: list[dict[str, str]],
+    system_text: str | None = None,
+) -> str:
+    chunks: list[str] = []
+    if system_text is not None:
+        chunks.append(f"<|system|>\n{system_text}\n")
+    for turn in turns:
+        chunks.append(f"<|{turn['role']}|>\n{turn['text']}\n")
+    return "".join(chunks)
+
+
+def _stable_hash_fraction(text: str) -> float:
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / 0x100000000
+
+
+# =============================================================================
+# Dataset (OpenThoughts — Hugging Face direct load)
+# =============================================================================
+
+# The system prompt baked into every OpenThoughts-114k training example.
+# Including it during inference primes the model to enter reasoning mode.
+OPENTHOUGHTS_SYSTEM_PROMPT = (
+    "Your role as an assistant involves thorough exploration of questions through a "
+    "systematic long thinking process before providing the final precise and accurate "
+    "solutions. This requires engaging in a comprehensive cycle of analysis, "
+    "summarizing, exploration, reassessment, reflection, backtracing and iteration to "
+    "develop well-considered thinking process. Please structure your response into two "
+    "main sections: Thought and Solution. In the Thought section, detail your reasoning "
+    "process using the specified format: <think> {your thoughts} </think>. The Solution "
+    "section should follow immediately after without additional labels."
+)
+
+
+def load_hf_openthoughts_texts(
+    dataset_name: str = "open-thoughts/OpenThoughts-114k",
+    val_ratio: float = 0.05,
+    min_chars: int = 64,
+    max_chars: int = 32_000,
+    max_train_records: int = 50_000,
+    max_val_records: int = 5_000,
+    include_system_prompt: bool = True,
+) -> tuple[list[str], list[str]]:
     """
-    Loads text samples from a JSONL file.
+    Loads open-thoughts/OpenThoughts-114k directly from Hugging Face and
+    returns train/val lists of serialized reasoning texts — no file I/O required.
 
-    Each non-empty line must contain a JSON object with a string field at
-    `text_key` (default: serialized conversation text).
+    Each assistant turn contains a full <think>...</think> reasoning trace
+    followed by the final answer. Records without a thinking trace are skipped.
     """
-    if max_records <= 0:
-        raise ValueError("max_records must be > 0")
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "Loading from Hugging Face requires the 'datasets' package. "
+            "Install with: pip install datasets"
+        ) from exc
 
-    path = Path(jsonl_path)
-    if not path.exists():
-        raise FileNotFoundError(f"JSONL file not found: {jsonl_path}")
+    print(f"Loading {dataset_name} from Hugging Face...")
+    dataset = load_dataset(dataset_name, split="train")
+    print(f"  Loaded {len(dataset)} records.")
 
-    texts: list[str] = []
-    with path.open("r", encoding="utf-8") as infile:
-        for line_number, line in enumerate(infile, start=1):
-            if len(texts) >= max_records:
-                break
+    train_texts: list[str] = []
+    val_texts: list[str] = []
 
-            stripped = line.strip()
-            if not stripped:
+    for record_idx, row in enumerate(dataset):
+        if not isinstance(row, dict):
+            continue
+
+        system_raw = row.get("system", None)
+        system_text: str | None = None
+        if include_system_prompt and isinstance(system_raw, str):
+            system_text = _normalize_text(system_raw)
+        elif include_system_prompt:
+            system_text = OPENTHOUGHTS_SYSTEM_PROMPT
+
+        conversations = row.get("conversations", [])
+        if not isinstance(conversations, list) or len(conversations) < 2:
+            continue
+
+        turns: list[dict[str, str]] = []
+        for conv in conversations:
+            if not isinstance(conv, dict):
                 continue
 
-            try:
-                obj = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"Invalid JSON in {jsonl_path} at line {line_number}"
-                ) from exc
+            from_field = conv.get("from", "")
+            value_field = conv.get("value", "")
 
-            value = obj.get(text_key) if isinstance(obj, dict) else None
-            if isinstance(value, str):
-                cleaned = value.strip()
-                if cleaned:
-                    texts.append(cleaned)
+            if not isinstance(from_field, str) or not isinstance(value_field, str):
+                continue
 
-    if len(texts) < 2:
+            from_lower = from_field.strip().lower()
+            if from_lower in ("human", "user"):
+                role = "user"
+            elif from_lower in ("gpt", "assistant", "model"):
+                role = "assistant"
+            else:
+                continue
+
+            text = _normalize_text(value_field)
+            if not text:
+                continue
+
+            turns.append({"role": role, "text": text})
+
+        if not turns:
+            continue
+
+        if turns[0]["role"] != "user" or turns[-1]["role"] != "assistant":
+            continue
+
+        # Skip records where the assistant turn lacks a reasoning trace.
+        if "</think>" not in turns[-1]["text"]:
+            continue
+
+        serialized_text = _serialize_turns(turns, system_text=system_text)
+        char_len = len(serialized_text)
+        if not (min_chars <= char_len <= max_chars):
+            continue
+
+        base_id = f"openthoughts_{record_idx:08d}"
+        split = "val" if _stable_hash_fraction(base_id) < val_ratio else "train"
+
+        if split == "train" and len(train_texts) >= max_train_records:
+            continue
+        if split == "val" and len(val_texts) >= max_val_records:
+            continue
+
+        if split == "val":
+            val_texts.append(serialized_text)
+        else:
+            train_texts.append(serialized_text)
+
+    if len(train_texts) < 2:
         raise ValueError(
-            f"Need at least 2 non-empty records in {jsonl_path} for training/eval"
+            f"Loaded fewer than 2 train samples from '{dataset_name}'. "
+            "Try relaxing quality filters or increasing max_train_records."
+        )
+    if len(val_texts) < 2:
+        raise ValueError(
+            f"Loaded fewer than 2 val samples from '{dataset_name}'. "
+            "Try increasing val_ratio or max_val_records."
         )
 
-    return texts
+    print(
+        f"HF dataset loaded: source={dataset_name}, "
+        f"train={len(train_texts)}, val={len(val_texts)}"
+    )
+    return train_texts, val_texts
 
 
 def _ensure_min_length(tokens: jax.Array, min_length: int) -> jax.Array:
@@ -973,34 +1083,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument(
-        "--train-jsonl",
+        "--dataset",
         type=str,
-        default=None,
-        help="Path to train JSONL file",
+        default="open-thoughts/OpenThoughts-114k",
+        help="Hugging Face dataset name",
     )
     parser.add_argument(
-        "--val-jsonl",
-        type=str,
-        default=None,
-        help="Path to validation JSONL file",
+        "--val-ratio",
+        type=float,
+        default=0.05,
+        help="Fraction of samples to use for validation",
     )
     parser.add_argument(
-        "--jsonl-text-key",
-        type=str,
-        default="serialized_text",
-        help="JSON key to read text from in JSONL records",
+        "--min-chars",
+        type=int,
+        default=64,
+        help="Minimum serialized char length to keep",
     )
     parser.add_argument(
-        "--jsonl-max-train-records",
+        "--max-chars",
+        type=int,
+        default=32000,
+        help="Maximum serialized char length to keep",
+    )
+    parser.add_argument(
+        "--max-train-records",
         type=int,
         default=50000,
-        help="Max train records to read from train JSONL",
+        help="Max train records to load",
     )
     parser.add_argument(
-        "--jsonl-max-val-records",
+        "--max-val-records",
         type=int,
         default=5000,
-        help="Max validation records to read from val JSONL",
+        help="Max validation records to load",
+    )
+    parser.add_argument(
+        "--no-system-prompt",
+        action="store_true",
+        help="Omit the system prompt when loading OpenThoughts data",
     )
     parser.add_argument(
         "--tokenizer-name",
@@ -1178,27 +1299,15 @@ def main() -> None:
         )
         return
 
-    # 3) Load conversational text data from JSONL files.
-    if not args.train_jsonl or not args.val_jsonl:
-        raise ValueError("--train-jsonl and --val-jsonl are required for training/eval")
-
-    train_texts = load_jsonl_texts(
-        jsonl_path=args.train_jsonl,
-        max_records=args.jsonl_max_train_records,
-        text_key=args.jsonl_text_key,
-    )
-    val_texts = load_jsonl_texts(
-        jsonl_path=args.val_jsonl,
-        max_records=args.jsonl_max_val_records,
-        text_key=args.jsonl_text_key,
-    )
-
-    print(
-        "Dataset setup: "
-        "source=jsonl, "
-        f"train_records={len(train_texts)}, "
-        f"val_records={len(val_texts)}, "
-        f"text_key={args.jsonl_text_key}"
+    # 3) Load OpenThoughts dataset directly from Hugging Face.
+    train_texts, val_texts = load_hf_openthoughts_texts(
+        dataset_name=args.dataset,
+        val_ratio=args.val_ratio,
+        min_chars=args.min_chars,
+        max_chars=args.max_chars,
+        max_train_records=args.max_train_records,
+        max_val_records=args.max_val_records,
+        include_system_prompt=not args.no_system_prompt,
     )
 
     if args.preview_first_story:
@@ -1207,7 +1316,7 @@ def main() -> None:
         if len(preview) > preview_limit:
             preview = preview[:preview_limit] + "..."
 
-        print("\nJSONL preview (first loaded sample):")
+        print("\nDataset preview (first loaded sample):")
         print(f"  {preview}")
 
     # Build optimizer: AdamW with warmup + cosine decay
