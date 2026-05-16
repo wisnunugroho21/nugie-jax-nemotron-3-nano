@@ -2,7 +2,7 @@
 Simple, minimal, and explainable Nemotron app.
 
 This script shows a full small workflow:
-1) Load a conversational JSONL dataset
+1) Load a conversational dataset (directly from Hugging Face, or from local JSONL files)
 2) Train a tiny Nemotron language model
 3) Evaluate it with validation loss + perplexity
 4) Chat with it in the terminal
@@ -16,8 +16,11 @@ Design goals:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -191,6 +194,220 @@ def encode_text_with_assistant_mask(
         cursor = next_tag_index + len(tag_text)
 
     return token_ids, loss_mask
+
+
+# =============================================================================
+# Dataset helpers (shared by JSONL and Hugging Face loaders)
+# =============================================================================
+
+
+def _normalize_text(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _serialize_turns(turns: list[dict[str, str]]) -> str:
+    chunks: list[str] = []
+    for turn in turns:
+        chunks.append(f"<|{turn['role']}|>\n{turn['text']}\n")
+    return "".join(chunks)
+
+
+def _stable_hash_fraction(text: str) -> float:
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / 0x100000000
+
+
+def _get_field(row: dict, keys: tuple) -> object:
+    for key in keys:
+        if key in row:
+            return row[key]
+    return None
+
+
+def _map_role(raw_role: object) -> str | None:
+    if not isinstance(raw_role, str):
+        return None
+    role = raw_role.strip().lower()
+    if role in {"prompter", "user", "human"}:
+        return "user"
+    if role in {"assistant", "gpt", "model"}:
+        return "assistant"
+    return None
+
+
+def _iter_paths_from_roots(
+    root_ids: list[str],
+    children_by_parent: dict[str, list[str]],
+) -> list[list[str]]:
+    all_paths: list[list[str]] = []
+
+    def dfs(node_id: str, path: list[str]) -> None:
+        children = children_by_parent.get(node_id, [])
+        if not children:
+            all_paths.append(path.copy())
+            return
+        for child_id in children:
+            path.append(child_id)
+            dfs(child_id, path)
+            path.pop()
+
+    for root_id in root_ids:
+        dfs(root_id, [root_id])
+    return all_paths
+
+
+def _passes_quality_filters(
+    turns: list[dict[str, str]],
+    min_turns: int,
+    max_turns: int,
+    min_chars: int,
+    max_chars: int,
+) -> bool:
+    if not (min_turns <= len(turns) <= max_turns):
+        return False
+    char_len = len(_serialize_turns(turns))
+    return min_chars <= char_len <= max_chars
+
+
+# =============================================================================
+# Dataset (Hugging Face direct load)
+# =============================================================================
+
+
+def load_hf_dataset_texts(
+    dataset_name: str = "OpenAssistant/oasst2",
+    lang: str = "en",
+    val_ratio: float = 0.02,
+    min_turns: int = 2,
+    max_turns: int = 20,
+    min_chars: int = 32,
+    max_chars: int = 6000,
+    max_train_records: int = 50000,
+    max_val_records: int = 5000,
+) -> tuple[list[str], list[str]]:
+    """
+    Loads a conversational dataset directly from Hugging Face and returns
+    train/val lists of serialized chat texts — no file I/O required.
+
+    Compatible with OpenAssistant/oasst2 and similarly-structured datasets.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "Loading from Hugging Face requires the 'datasets' package. "
+            "Install with: pip install datasets"
+        ) from exc
+
+    dataset = load_dataset(dataset_name, split="train")
+
+    node_by_id: dict[str, dict] = {}
+    children_by_parent: dict[str, list[str]] = defaultdict(list)
+    root_ids: list[str] = []
+
+    for row in dataset:
+        if not isinstance(row, dict):
+            continue
+
+        row_lang = _get_field(row, ("lang", "language"))
+        if isinstance(row_lang, str) and row_lang.lower() != lang.lower():
+            continue
+
+        node_id_raw = _get_field(row, ("message_id", "id"))
+        parent_id_raw = _get_field(row, ("parent_id", "parent_message_id"))
+
+        if node_id_raw is None:
+            continue
+
+        node_id = str(node_id_raw)
+        parent_id = str(parent_id_raw) if parent_id_raw is not None else None
+
+        node_by_id[node_id] = row
+        if parent_id is None or parent_id == "None":
+            root_ids.append(node_id)
+        else:
+            children_by_parent[parent_id].append(node_id)
+
+    for parent_id in list(children_by_parent.keys()):
+        children_by_parent[parent_id].sort()
+    root_ids = sorted(set(root_ids))
+
+    paths = _iter_paths_from_roots(root_ids, children_by_parent)
+
+    train_texts: list[str] = []
+    val_texts: list[str] = []
+
+    for path_idx, path_node_ids in enumerate(paths):
+        turns: list[dict[str, str]] = []
+
+        for node_id in path_node_ids:
+            row = node_by_id.get(node_id)
+            if row is None:
+                continue
+
+            mapped_role = _map_role(_get_field(row, ("role", "speaker")))
+            if mapped_role not in {"user", "assistant"}:
+                continue
+
+            text_raw = _get_field(row, ("text", "message", "content"))
+            if not isinstance(text_raw, str):
+                continue
+
+            text = _normalize_text(text_raw)
+            if not text:
+                continue
+
+            if turns and turns[-1]["role"] == mapped_role:
+                turns[-1]["text"] = f"{turns[-1]['text']}\n\n{text}"
+            else:
+                turns.append({"role": mapped_role, "text": text})
+
+        if not turns:
+            continue
+
+        while turns and turns[0]["role"] != "user":
+            turns.pop(0)
+        while turns and turns[-1]["role"] != "assistant":
+            turns.pop()
+
+        if not turns:
+            continue
+
+        if not _passes_quality_filters(turns, min_turns, max_turns, min_chars, max_chars):
+            continue
+
+        base_id = f"oasst2_path_{path_idx:08d}"
+        split = "val" if _stable_hash_fraction(base_id) < val_ratio else "train"
+
+        if split == "train" and len(train_texts) >= max_train_records:
+            continue
+        if split == "val" and len(val_texts) >= max_val_records:
+            continue
+
+        serialized_text = _serialize_turns(turns)
+        if split == "val":
+            val_texts.append(serialized_text)
+        else:
+            train_texts.append(serialized_text)
+
+    if len(train_texts) < 2:
+        raise ValueError(
+            f"Loaded fewer than 2 train samples from '{dataset_name}'. "
+            "Try relaxing quality filters or increasing max_train_records."
+        )
+    if len(val_texts) < 2:
+        raise ValueError(
+            f"Loaded fewer than 2 val samples from '{dataset_name}'. "
+            "Try increasing val_ratio or max_val_records."
+        )
+
+    print(
+        f"HF dataset loaded: source={dataset_name}, lang={lang}, "
+        f"train={len(train_texts)}, val={len(val_texts)}"
+    )
+    return train_texts, val_texts
 
 
 # =============================================================================
@@ -849,6 +1066,60 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Max validation records to read from val JSONL",
     )
     parser.add_argument(
+        "--hf-dataset",
+        type=str,
+        default="OpenAssistant/oasst2",
+        help="Hugging Face dataset name to load directly (used when --train-jsonl/--val-jsonl are not provided)",
+    )
+    parser.add_argument(
+        "--hf-lang",
+        type=str,
+        default="en",
+        help="Language filter for HF dataset (e.g. 'en')",
+    )
+    parser.add_argument(
+        "--hf-val-ratio",
+        type=float,
+        default=0.02,
+        help="Fraction of HF dataset samples to use for validation",
+    )
+    parser.add_argument(
+        "--hf-min-turns",
+        type=int,
+        default=2,
+        help="Minimum conversation turns to keep (HF dataset filter)",
+    )
+    parser.add_argument(
+        "--hf-max-turns",
+        type=int,
+        default=20,
+        help="Maximum conversation turns to keep (HF dataset filter)",
+    )
+    parser.add_argument(
+        "--hf-min-chars",
+        type=int,
+        default=32,
+        help="Minimum serialized char length to keep (HF dataset filter)",
+    )
+    parser.add_argument(
+        "--hf-max-chars",
+        type=int,
+        default=6000,
+        help="Maximum serialized char length to keep (HF dataset filter)",
+    )
+    parser.add_argument(
+        "--hf-max-train-records",
+        type=int,
+        default=50000,
+        help="Max train records to load from HF dataset",
+    )
+    parser.add_argument(
+        "--hf-max-val-records",
+        type=int,
+        default=5000,
+        help="Max validation records to load from HF dataset",
+    )
+    parser.add_argument(
         "--tokenizer-name",
         type=str,
         default="google/byt5-small",
@@ -992,28 +1263,39 @@ def main() -> None:
         )
         return
 
-    # 3) Load conversational text data from JSONL files.
-    if not args.train_jsonl or not args.val_jsonl:
-        raise ValueError("--train-jsonl and --val-jsonl are required for training/eval")
-
-    train_texts = load_jsonl_texts(
-        jsonl_path=args.train_jsonl,
-        max_records=args.jsonl_max_train_records,
-        text_key=args.jsonl_text_key,
-    )
-    val_texts = load_jsonl_texts(
-        jsonl_path=args.val_jsonl,
-        max_records=args.jsonl_max_val_records,
-        text_key=args.jsonl_text_key,
-    )
-
-    print(
-        "Dataset setup: "
-        "source=jsonl, "
-        f"train_records={len(train_texts)}, "
-        f"val_records={len(val_texts)}, "
-        f"text_key={args.jsonl_text_key}"
-    )
+    # 3) Load conversational text data.
+    if args.train_jsonl and args.val_jsonl:
+        # Load from local JSONL files.
+        train_texts = load_jsonl_texts(
+            jsonl_path=args.train_jsonl,
+            max_records=args.jsonl_max_train_records,
+            text_key=args.jsonl_text_key,
+        )
+        val_texts = load_jsonl_texts(
+            jsonl_path=args.val_jsonl,
+            max_records=args.jsonl_max_val_records,
+            text_key=args.jsonl_text_key,
+        )
+        print(
+            "Dataset setup: "
+            "source=jsonl, "
+            f"train_records={len(train_texts)}, "
+            f"val_records={len(val_texts)}, "
+            f"text_key={args.jsonl_text_key}"
+        )
+    else:
+        # Load directly from Hugging Face — no local files needed.
+        train_texts, val_texts = load_hf_dataset_texts(
+            dataset_name=args.hf_dataset,
+            lang=args.hf_lang,
+            val_ratio=args.hf_val_ratio,
+            min_turns=args.hf_min_turns,
+            max_turns=args.hf_max_turns,
+            min_chars=args.hf_min_chars,
+            max_chars=args.hf_max_chars,
+            max_train_records=args.hf_max_train_records,
+            max_val_records=args.hf_max_val_records,
+        )
 
     if args.preview_first_story:
         preview = train_texts[0].replace("\n", " ").strip()
@@ -1021,7 +1303,7 @@ def main() -> None:
         if len(preview) > preview_limit:
             preview = preview[:preview_limit] + "..."
 
-        print("\nJSONL preview (first loaded sample):")
+        print("\nDataset preview (first loaded sample):")
         print(f"  {preview}")
 
     # Build optimizer: AdamW with warmup + cosine decay
