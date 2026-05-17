@@ -110,7 +110,7 @@ def make_batches(chunks: np.ndarray, batch_size: int):
 
 def build_model(seed: int = 0) -> NemotronNanoBlock:
     """Build a tiny Nemotron configured for the GPT-2 vocabulary."""
-    config = NemotronConfig()          # tiny defaults (d_model=128, etc.)
+    config = NemotronConfig.from_preset("tiny")          # tiny defaults (d_model=128, etc.)
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
@@ -343,7 +343,7 @@ def main() -> None:
 
     # ── 3. Model + optimizer ──────────────────────────────────────────────────
     print("\nBuilding model ...")
-    config     = NemotronConfig()
+    config     = NemotronConfig().from_preset("tiny")          # tiny defaults (d_model=128, etc.)
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()

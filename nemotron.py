@@ -198,7 +198,7 @@ class NemotronConfig:
             )
 
         raise ValueError(
-            f"Unknown preset '{preset}'. Supported presets: tiny, paper_close"
+            f"Unknown preset '{preset}'. Supported presets: tiny, kaggle, colab, paper_close"
         )
 
     def validate(self) -> None:
