@@ -122,7 +122,6 @@ class NemotronConfig:
         if key in ("kaggle", "colab"):
             return cls(
                 # Bigger model than tiny defaults.
-                d_model=2048,
                 patterns = [
                     ("mamba_moe",         2),
                     ("mamba_attention_moe", 1),
