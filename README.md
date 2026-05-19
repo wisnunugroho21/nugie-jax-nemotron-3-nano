@@ -126,6 +126,21 @@ Google Colab:
 python pretrained.py
 ```
 
+### Smoke Tests (One Command)
+
+Run a quick automated sanity pass across project syntax, imports, model
+construction, forward shapes, and a single optimizer/train-step update:
+
+```bash
+python smoke_test.py
+```
+
+If you want a faster check that skips the train-step/JIT compilation path:
+
+```bash
+python smoke_test.py --skip-train-step
+```
+
 Key hyperparameters are constants at the top of `pretrained.py`:
 
 ```python

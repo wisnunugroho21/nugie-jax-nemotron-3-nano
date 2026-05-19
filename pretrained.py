@@ -23,7 +23,7 @@ import optax
 import orbax.checkpoint as ocp
 from datasets import load_dataset
 from flax import nnx
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer
 
 from latent_moe import LatentMoE
 from multi_token_prediction import mtp_loss
@@ -180,14 +180,21 @@ def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr
     Creates an Optax gradient transformation for optimizer with the custom learning rate schedule.
     We use AdamW with weight decay, which is common for transformer training.
     """
-    max_steps = max(max_steps, 1)
-    warmup_steps = max(1, max_steps // 10)
-    
-    lr_schedule = create_lr_schedule(
-        max_steps=max_steps,
-        warmup_steps=warmup_steps,
-        peak_lr=peak_lr,
-    )
+    max_steps = max(int(max_steps), 1)
+    warmup_steps = max(int(warmup_steps), 0)
+
+    if warmup_steps > 0:
+        lr_schedule = create_lr_schedule(
+            max_steps=max_steps,
+            warmup_steps=min(warmup_steps, max_steps),
+            peak_lr=peak_lr,
+        )
+    else:
+        # Allow disabling warmup explicitly (warmup_steps=0).
+        lr_schedule = optax.cosine_decay_schedule(
+            init_value=peak_lr,
+            decay_steps=max_steps,
+        )
 
     return optax.chain(
         optax.clip_by_global_norm(1.0),

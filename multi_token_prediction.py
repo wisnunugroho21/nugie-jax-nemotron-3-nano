@@ -360,6 +360,9 @@ def mtp_loss(
     Returns:
         Scalar loss: mean cross-entropy across depths, multiplied by scale.
     """
+    if not mtp_outputs:
+        return jnp.array(0.0, dtype=jnp.float32)
+
     per_depth_losses = [
         optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
         for logits, labels in mtp_outputs
