@@ -431,8 +431,8 @@ def main() -> None:
     # Stream 2 000 texts for training, then 200 more (skipped past train) for
     # validation so the two sets never overlap.
     # Increase max_samples for a longer/better training run.
-    train_texts = load_raw_texts(max_samples=2000, skip=0)
-    val_texts = load_raw_texts(max_samples=200, skip=2000)
+    train_texts = load_raw_texts(max_samples=10000, skip=0)
+    val_texts = load_raw_texts(max_samples=200, skip=10000)
 
     train_chunks = tokenize_and_pack(train_texts, tokenizer, SEQ_LEN)
     val_chunks = tokenize_and_pack(val_texts, tokenizer, SEQ_LEN)
