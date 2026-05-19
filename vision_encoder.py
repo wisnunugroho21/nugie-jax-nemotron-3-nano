@@ -22,8 +22,6 @@ Key design choices (matching the paper):
 
 Simplified from real C-RADIO:
 - Multi-teacher distillation is now included (configure via VisionEncoderConfig.teachers)
-- No register tokens (real C-RADIOv4-H does not use register tokens either)
-- No RoPE positional encoding in attention (real C-RADIOv4-H does not use it either)
 """
 
 import math
