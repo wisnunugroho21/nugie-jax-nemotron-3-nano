@@ -475,11 +475,11 @@ class NemotronSuperConfig:
        Training batches must be `num_mtp_heads + 1` tokens longer than the
        main model sequence length so the extra future tokens are available.
 
-        3. Load balancing in MoE routing:
-             Nemotron 3 Super uses both bias-based (aux-loss-free) balancing and a
-             standard load-balancing loss term during training.
-             - `load_balancing_loss_coef`: coefficient for the standard MoE
-                 load-balancing loss (1e-4 in the paper).
+    3. Load balancing in MoE routing:
+       Nemotron 3 Super uses both bias-based (aux-loss-free) balancing and a
+       standard load-balancing loss term during training.
+       - `load_balancing_loss_coef`: coefficient for the standard MoE
+         load-balancing loss (1e-4 in the paper, §2.4).
 
     Nano code (NemotronConfig, NemotronNanoBlock) is completely untouched.
 
@@ -498,7 +498,7 @@ class NemotronSuperConfig:
       shared_expert_hidden_dim = 5376
       num_mtp_heads            = 2
       mtp_loss_scale           = 0.3
-    load_balancing_loss_coef = 1e-4
+      load_balancing_loss_coef = 1e-4
     """
 
     # Token / model sizes

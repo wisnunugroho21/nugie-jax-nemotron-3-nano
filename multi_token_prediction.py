@@ -2,7 +2,7 @@
 Multi-Token Prediction (MTP) for Nemotron 3 Super in JAX/Flax NNX.
 
 Based on "Multi-Token Prediction" (Gloeckle et al., 2024) and DeepSeek-V3
-(DeepSeek-AI, 2024), as incorporated in Nemotron 3 Super (arXiv:2604.12374, §2.5).
+(DeepSeek-AI, 2024), as incorporated in Nemotron 3 Super (arXiv:2604.12374, §2.1.2).
 
 Standard language model training predicts one token ahead:
   Main model: hidden state at position n → predicts token n+1
@@ -355,7 +355,7 @@ def mtp_loss(
         mtp_outputs: List of (logits, labels) tuples from MultiTokenPrediction.__call__.
             logits: (batch, seq, vocab_size)
             labels: (batch, seq)  — integer token IDs
-        scale: Loss scaling factor (0.3 per Nemotron 3 Super §2.5).
+        scale: Loss scaling factor (0.3 per Nemotron 3 Super §2.1.2).
 
     Returns:
         Scalar loss: mean cross-entropy across depths, multiplied by scale.

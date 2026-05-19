@@ -213,7 +213,12 @@ def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr
 
     return optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay),
+        optax.adamw(
+            learning_rate=lr_schedule,
+            weight_decay=weight_decay,
+            b1=0.9,
+            b2=0.95,   # paper §2.4: β2=0.95 (Optax default is 0.999)
+        ),
     )
 
 
