@@ -137,14 +137,20 @@ def cross_entropy_loss(model: NemotronSuperBlock, batch: jax.Array) -> jax.Array
 
     batch: (B, seq_len + NUM_MTP_HEADS + 1)
       NemotronSuperBlock.forward_train handles all slicing internally.
-      The returned loss is main_loss + mtp_loss_scale * mean(mtp_losses).
+      The returned loss is:
+        main_loss
+        + mtp_loss_scale * mean(mtp_losses)
+        + load_balancing_loss_coef * mean(moe_load_balance_losses).
     """
     main_logits, main_labels, mtp_outputs = model.forward_train(batch)
     main_loss = optax.softmax_cross_entropy_with_integer_labels(
         main_logits, main_labels
     ).mean()
-    aux_loss = mtp_loss(mtp_outputs, scale=model.config.mtp_loss_scale)
-    return main_loss + aux_loss
+    mtp_aux_loss = mtp_loss(mtp_outputs, scale=model.config.mtp_loss_scale)
+    load_balance_aux_loss = (
+        model.config.load_balancing_loss_coef * model.load_balancing_loss()
+    )
+    return main_loss + mtp_aux_loss + load_balance_aux_loss
 
 # =============================================================================
 # 4. Learning Rate Schedule
@@ -154,25 +160,41 @@ def create_lr_schedule(
     max_steps: int, warmup_steps: int, peak_lr: float
 ) -> optax.Schedule:
     """
-    Creates a two-phase learning rate schedule:
-      Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
-      Phase 2 (steps warmup_steps .. max_steps): cosine decay peak_lr → 0
+    Create a Warmup-Stable-Decay (WSD) learning rate schedule.
 
-    This avoids early training instability (warmup) while allowing the
-    optimizer to fine-tune at smaller learning rates later (cosine decay).
+    Phases:
+      1) Warmup: linear ramp 0 → peak_lr for warmup_steps.
+      2) Stable: constant peak_lr until 80% of max_steps.
+      3) Decay:  inverse-sqrt decay to 1% of peak_lr over the final 20%.
+
+    This mirrors the schedule family described in the Nemotron 3 Super paper.
     """
+    max_steps = max(int(max_steps), 1)
+    warmup_steps = max(int(warmup_steps), 0)
+
+    decay_start = max(warmup_steps, int(0.8 * max_steps))
+    min_lr = peak_lr * 0.01
+
     warmup = optax.linear_schedule(
         init_value=0.0,
         end_value=peak_lr,
-        transition_steps=warmup_steps,
+        transition_steps=max(warmup_steps, 1),
     )
-    decay = optax.cosine_decay_schedule(
-        init_value=peak_lr,
-        decay_steps=max(max_steps - warmup_steps, 1),
-    )
+
+    stable = optax.constant_schedule(peak_lr)
+
+    decay_steps = max(max_steps - decay_start, 1)
+    min_ratio = min_lr / peak_lr
+    k = (1.0 / (min_ratio * min_ratio)) - 1.0
+
+    def minus_sqrt_decay(step: jax.Array) -> jax.Array:
+        t = jnp.clip(step.astype(jnp.float32), 0.0, float(decay_steps))
+        frac = t / float(decay_steps)
+        return peak_lr / jnp.sqrt(1.0 + k * frac)
+
     return optax.join_schedules(
-        schedules=[warmup, decay],
-        boundaries=[warmup_steps],
+        schedules=[warmup, stable, minus_sqrt_decay],
+        boundaries=[warmup_steps, decay_start],
     )
 
 def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr: float = 3e-4, weight_decay: float = 0.1) -> optax.GradientTransformation:
@@ -181,20 +203,13 @@ def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr
     We use AdamW with weight decay, which is common for transformer training.
     """
     max_steps = max(int(max_steps), 1)
-    warmup_steps = max(int(warmup_steps), 0)
+    warmup_steps = min(max(int(warmup_steps), 0), max_steps)
 
-    if warmup_steps > 0:
-        lr_schedule = create_lr_schedule(
-            max_steps=max_steps,
-            warmup_steps=min(warmup_steps, max_steps),
-            peak_lr=peak_lr,
-        )
-    else:
-        # Allow disabling warmup explicitly (warmup_steps=0).
-        lr_schedule = optax.cosine_decay_schedule(
-            init_value=peak_lr,
-            decay_steps=max_steps,
-        )
+    lr_schedule = create_lr_schedule(
+        max_steps=max_steps,
+        warmup_steps=warmup_steps,
+        peak_lr=peak_lr,
+    )
 
     return optax.chain(
         optax.clip_by_global_norm(1.0),

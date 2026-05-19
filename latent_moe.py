@@ -3,7 +3,7 @@ Latent-space Mixture-of-Experts (LatentMoE) in JAX/Flax NNX.
 
 Based on "Efficient Large Language Models via Latent Space Routing for
 Mixture-of-Experts" (arXiv:2601.18089), as used in Nemotron 3 Super
-(arXiv:2604.12374, §2.4).
+(arXiv:2604.12374, §2.1.1 and §2.4).
 
 The core efficiency insight is about memory bandwidth, not FLOPs.
 In a standard MoE layer, each routed expert has weight matrices of size d×m
@@ -35,7 +35,8 @@ Two parts of the MoE intentionally stay in full d-space:
 
 Routing and load balancing are identical to SparseMoE in moe.py:
   - Sigmoid gate scores (experts score independently, no probability competition)
-  - Aux-loss-free load balancing via per-expert bias scalars (Wang et al. 2024)
+    - Aux-loss-free load balancing via per-expert bias scalars (Wang et al. 2024)
+    - Standard load-balancing loss (GShard-style) can be added during training
   - Biased scores for top-k selection; original unbiased scores for gate weights
 
 Nemotron 3 Super hyperparameters (Table 1):
@@ -60,7 +61,7 @@ from flax import nnx
 
 class LatentMoE(nnx.Module):
     """
-    LatentMoE layer for Nemotron 3 Super (arXiv:2604.12374, §2.4).
+    LatentMoE layer for Nemotron 3 Super (arXiv:2604.12374, §2.1.1 and §2.4).
 
     Routing, gating, and load balancing are identical to SparseMoE in moe.py.
     The key structural difference is where the expert FNN computations happen:
@@ -152,6 +153,11 @@ class LatentMoE(nnx.Module):
         self.last_topk_indices = nnx.Variable(
             jnp.zeros((1, top_k), dtype=jnp.int32)
         )
+
+        # Stores the most recent standard load-balancing loss term.
+        # Training code can aggregate this across MoE layers and scale it
+        # (paper uses coefficient 1e-4).
+        self.last_load_balance_loss = nnx.Variable(jnp.array(0.0, dtype=jnp.float32))
 
         init = nnx.initializers.lecun_normal()
 
@@ -294,6 +300,34 @@ class LatentMoE(nnx.Module):
             - self.bias_update_rate * jnp.sign(actual_count - expected_count)
         )
 
+    def _standard_load_balance_loss(
+        self,
+        router_scores: jax.Array,
+        topk_indices: jax.Array,
+    ) -> jax.Array:
+        """Compute a standard MoE load-balancing loss term.
+
+        This complements the bias-based routing update and can be scaled in the
+        global training objective (paper coefficient: 1e-4).
+
+        Args:
+            router_scores: (num_tokens, num_experts) sigmoid scores.
+            topk_indices: (num_tokens, top_k) selected experts.
+        Returns:
+            Scalar load-balancing loss.
+        """
+        # Fraction of top-k assignment slots used by each expert.
+        expert_load = jnp.mean(
+            jax.nn.one_hot(topk_indices, self.num_experts, dtype=router_scores.dtype),
+            axis=(0, 1),
+        )  # (num_experts,)
+
+        # Mean router score per expert over tokens.
+        expert_importance = jnp.mean(router_scores, axis=0)  # (num_experts,)
+
+        # GShard-style balancing term.
+        return self.num_experts * jnp.sum(expert_load * expert_importance)
+
     def __call__(self, x: jax.Array) -> jax.Array:
         """
         Forward pass through the LatentMoE layer.
@@ -342,6 +376,11 @@ class LatentMoE(nnx.Module):
         # Store indices so the training loop can call update_expert_bias() after
         # the optimizer step without needing to re-run the forward pass.
         self.last_topk_indices.set_value(topk_indices)
+
+        # Store standard load-balancing loss from this forward pass.
+        self.last_load_balance_loss.set_value(
+            self._standard_load_balance_loss(router_scores, topk_indices)
+        )
 
         # Gate weights use UNBIASED scores — the bias is a routing hint, not a
         # magnitude signal. Using original scores preserves each expert's

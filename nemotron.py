@@ -36,6 +36,7 @@ The Mamba + Attention + MoE hybrid is well-suited for this because:
 from dataclasses import dataclass, field
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 
 from attention import GroupedQueryAttention
@@ -380,8 +381,7 @@ class NemotronNanoBlock(nnx.Module):
     Layout:
       token embedding -> N x NemotronBlock -> RMSNorm -> LM head
 
-        RoPE is applied inside attention blocks; there is no separate learned
-        positional embedding table.
+            No positional embeddings are used.
     """
 
     def __init__(self, rngs: nnx.Rngs, config: NemotronConfig):
@@ -467,13 +467,19 @@ class NemotronSuperConfig:
        - `granularity_factor` is NOT present — latent projection is the
          efficiency mechanism in Super; granularity is a Nano-only concept.
 
-    2. Multi-Token Prediction (arXiv:2604.12374 §2.5):
+    2. Multi-Token Prediction (arXiv:2604.12374 §2.1.2 and §2.4):
        Jointly trains the model to predict `num_mtp_heads` tokens further into
        the future in addition to the standard next-token objective.
        - `num_mtp_heads`: number of extra prediction depths (2 for Super).
        - `mtp_loss_scale`: weight applied to the MTP auxiliary loss (0.3).
        Training batches must be `num_mtp_heads + 1` tokens longer than the
        main model sequence length so the extra future tokens are available.
+
+        3. Load balancing in MoE routing:
+             Nemotron 3 Super uses both bias-based (aux-loss-free) balancing and a
+             standard load-balancing loss term during training.
+             - `load_balancing_loss_coef`: coefficient for the standard MoE
+                 load-balancing loss (1e-4 in the paper).
 
     Nano code (NemotronConfig, NemotronNanoBlock) is completely untouched.
 
@@ -492,6 +498,7 @@ class NemotronSuperConfig:
       shared_expert_hidden_dim = 5376
       num_mtp_heads            = 2
       mtp_loss_scale           = 0.3
+    load_balancing_loss_coef = 1e-4
     """
 
     # Token / model sizes
@@ -527,6 +534,9 @@ class NemotronSuperConfig:
     # Multi-Token Prediction settings
     num_mtp_heads: int = 2                 # extra prediction depths (2 for Super)
     mtp_loss_scale: float = 0.3            # auxiliary MTP loss weight
+
+    # MoE load-balancing loss (used alongside bias-based balancing)
+    load_balancing_loss_coef: float = 1e-4
 
     # Normalization
     rms_norm_eps: float = 1e-6
@@ -614,6 +624,7 @@ class NemotronSuperConfig:
                 # MTP
                 num_mtp_heads=2,
                 mtp_loss_scale=0.3,
+                load_balancing_loss_coef=1e-4,
                 rms_norm_eps=1e-6,
             )
 
@@ -663,6 +674,11 @@ class NemotronSuperConfig:
         # MTP constraints.
         assert self.num_mtp_heads >= 0, "num_mtp_heads must be >= 0"
         assert self.mtp_loss_scale > 0, "mtp_loss_scale must be > 0"
+
+        # MoE load-balancing coefficient.
+        assert self.load_balancing_loss_coef >= 0, (
+            "load_balancing_loss_coef must be >= 0"
+        )
 
 
 # =============================================================================
@@ -882,7 +898,11 @@ class NemotronSuperBlock(nnx.Module):
             main_loss = optax.softmax_cross_entropy_with_integer_labels(
                 main_logits, main_labels
             ).mean()
-            total_loss = main_loss + mtp_loss(mtp_outputs, scale=config.mtp_loss_scale)
+            total_loss = (
+                main_loss
+                + mtp_loss(mtp_outputs, scale=config.mtp_loss_scale)
+                + config.load_balancing_loss_coef * model.load_balancing_loss()
+            )
         """
         T = token_ids_extended.shape[1] - self.config.num_mtp_heads - 1
 
@@ -910,6 +930,16 @@ class NemotronSuperBlock(nnx.Module):
         mtp_outputs = self.mtp(main_hidden, extended, self.embedding)
 
         return main_logits, main_labels, mtp_outputs
+
+    def load_balancing_loss(self) -> jax.Array:
+        """Return the mean standard load-balancing loss across all LatentMoE layers."""
+        losses = [
+            moe.last_load_balance_loss.get_value()
+            for moe in self.collect_moe_layers()
+        ]
+        if not losses:
+            return jnp.array(0.0, dtype=jnp.float32)
+        return jnp.mean(jnp.stack(losses))
 
     def collect_moe_layers(self) -> list[LatentMoE]:
         """

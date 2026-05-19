@@ -117,7 +117,7 @@ Google Colab:
 
 1. **Tokenization**: Loads the `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` tokenizer from Hugging Face.
 2. **Dataset**: Streams text from `HuggingFaceFW/fineweb-edu` (no full download required). Each packed chunk is `SEQ_LEN + NUM_MTP_HEADS + 1` tokens wide to supply both the main next-token targets and the MTP auxiliary targets.
-3. **Training**: Combined next-token + MTP auxiliary loss with AdamW + linear warmup + cosine decay.
+3. **Training**: Combined next-token + MTP auxiliary + MoE load-balancing losses with AdamW + warmup-stable-minus-sqrt (WSD-style) LR schedule.
 4. **Checkpointing**: Saves model weights via Orbax every `CHECKPOINT_EVERY` steps; resumes from latest checkpoint automatically.
 5. **Evaluation**: Reports validation loss and perplexity (main next-token loss only) after training.
 6. **Interactive Chat**: Launches a terminal chat loop after training completes.
