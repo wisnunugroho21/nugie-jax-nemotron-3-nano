@@ -32,25 +32,34 @@ from nemotron import NemotronConfig, NemotronNanoBlock
 # Hyperparameters
 # =============================================================================
 
-VOCAB_SIZE       = 131072  # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 tokenizer vocabulary
-SEQ_LEN          = 256     # input tokens per sample — must be divisible by CHUNK_SIZE
-CHUNK_SIZE       = 64      # Mamba SSD chunk size — must match NemotronConfig.mamba_chunk_size
-BATCH_SIZE       = 2
-LEARNING_RATE    = 3e-4
-CHECKPOINT_EVERY = 200     # save a checkpoint every N training steps
-MAX_TRAIN_STEPS  = 10000
-WARMUP_STEPS     = 1000    # linear warmup for the first N steps
-VAL_STEPS        = 50      # how many batches to average for validation
-CHECKPOINT_DIR   = "./checkpoints"
-MAX_GEN_TOKENS   = 200     # max new tokens per chat response
-MAX_CTX_LEN      = 512     # rolling context window during generation — must be % CHUNK_SIZE == 0
+VOCAB_SIZE = 131072  # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 tokenizer vocabulary
+SEQ_LEN = 256  # input tokens per sample — must be divisible by CHUNK_SIZE
+CHUNK_SIZE = 64  # Mamba SSD chunk size — must match NemotronConfig.mamba_chunk_size
+BATCH_SIZE = 2
+CHECKPOINT_EVERY = 200  # save a checkpoint every N training steps
+MAX_TRAIN_STEPS = 10000
+WARMUP_STEPS = int(MAX_TRAIN_STEPS * 0.1)  # linear warmup for the first N steps
+STABLE_STEPS = int(MAX_TRAIN_STEPS * 0.7)
+DECAY_STEPS = int(MAX_TRAIN_STEPS * 0.2)
+PEAK_LR = 3e-4
+MIN_LR = 1e-5
+WEIGHT_DECAY = 0.1
+B1 = 0.9  # Adam beta1
+B2 = 0.95  # Adam beta2
+VAL_STEPS = 50  # how many batches to average for validation
+CHECKPOINT_DIR = "./checkpoints"
+MAX_GEN_TOKENS = 200  # max new tokens per chat response
+MAX_CTX_LEN = (
+    512  # rolling context window during generation — must be % CHUNK_SIZE == 0
+)
 
-assert SEQ_LEN % CHUNK_SIZE == 0,     "SEQ_LEN must be divisible by CHUNK_SIZE"
+assert SEQ_LEN % CHUNK_SIZE == 0, "SEQ_LEN must be divisible by CHUNK_SIZE"
 assert MAX_CTX_LEN % CHUNK_SIZE == 0, "MAX_CTX_LEN must be divisible by CHUNK_SIZE"
 
 # =============================================================================
 # 1. Dataset helpers
 # =============================================================================
+
 
 def load_raw_texts(max_samples: int, skip: int = 0) -> list[str]:
     """Stream texts from HuggingFaceFW/fineweb-edu.
@@ -109,9 +118,10 @@ def make_batches(chunks: np.ndarray, batch_size: int):
 # 2. Model
 # =============================================================================
 
+
 def build_model(seed: int = 0) -> NemotronNanoBlock:
     """Build a tiny Nemotron configured for the GPT-2 vocabulary."""
-    config = NemotronConfig.from_preset("tiny")          # tiny defaults (d_model=128, etc.)
+    config = NemotronConfig.from_preset("tiny")  # tiny defaults (d_model=128, etc.)
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
@@ -127,6 +137,7 @@ def collect_moe_layers(model: NemotronNanoBlock) -> list[SparseMoE]:
 # 3. Loss
 # =============================================================================
 
+
 def cross_entropy_loss(model: NemotronNanoBlock, batch: jax.Array) -> jax.Array:
     """Standard next-token prediction loss.
 
@@ -134,23 +145,30 @@ def cross_entropy_loss(model: NemotronNanoBlock, batch: jax.Array) -> jax.Array:
       inputs = batch[:, :-1]  →  fed into the model
       labels = batch[:, 1:]   →  the shifted-by-one targets
     """
-    inputs = batch[:, :-1]          # (B, seq_len)
-    labels = batch[:, 1:]           # (B, seq_len)
-    logits = model(inputs)          # (B, seq_len, vocab_size)
+    inputs = batch[:, :-1]  # (B, seq_len)
+    labels = batch[:, 1:]   # (B, seq_len)
+    logits = model(inputs)  # (B, seq_len, vocab_size)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
     return loss.mean()
+
 
 # =============================================================================
 # 4. Learning Rate Schedule
 # =============================================================================
 
+
 def create_lr_schedule(
-    max_steps: int, warmup_steps: int, peak_lr: float
+    peak_lr: float,
+    min_lr: float,
+    warmup_steps: int,
+    stable_steps: int,
+    decay_steps: int,
 ) -> optax.Schedule:
     """
     Creates a two-phase learning rate schedule:
-      Phase 1 (steps 0 .. warmup_steps):        linear ramp  0 → peak_lr
-      Phase 2 (steps warmup_steps .. max_steps): cosine decay peak_lr → 0
+        Phase 1 — Warmup  : linear ramp from 0 → peak_lr
+        Phase 2 — Stable  : constant at peak_lr
+        Phase 3 — Decay   : cosine decay from peak_lr → min_lr
 
     This avoids early training instability (warmup) while allowing the
     optimizer to fine-tune at smaller learning rates later (cosine decay).
@@ -160,38 +178,61 @@ def create_lr_schedule(
         end_value=peak_lr,
         transition_steps=warmup_steps,
     )
+    stable = optax.constant_schedule(peak_lr)
     decay = optax.cosine_decay_schedule(
         init_value=peak_lr,
-        decay_steps=max(max_steps - warmup_steps, 1),
-    )
-    return optax.join_schedules(
-        schedules=[warmup, decay],
-        boundaries=[warmup_steps],
+        decay_steps=decay_steps,
+        alpha=min_lr / peak_lr,  # final LR = peak_lr * alpha = min_lr
     )
 
-def make_gradient_transform_optimizer(max_steps: int, warmup_steps: int, peak_lr: float = 3e-4, weight_decay: float = 0.1) -> optax.GradientTransformation:
+    return optax.join_schedules(
+        schedules=[warmup, stable, decay],
+        boundaries=[warmup_steps, warmup_steps + stable_steps],
+    )
+
+
+def make_gradient_transform_optimizer(
+    peak_lr: float,
+    min_lr: float,
+    warmup_steps: int,
+    stable_steps: int,
+    decay_steps: int,
+    weight_decay: float = 0.1,
+    b1: float = 0.9,
+    b2: float = 0.95,
+) -> optax.GradientTransformation:
     """
     Creates an Optax gradient transformation for optimizer with the custom learning rate schedule.
     We use AdamW with weight decay, which is common for transformer training.
     """
-    max_steps = max(max_steps, 1)
-    warmup_steps = max(1, max_steps // 10)
-    
+    warmup_steps = max(
+        warmup_steps, 1
+    )  # sanity check to avoid division by zero in warmup schedule
+    stable_steps = max(
+        stable_steps, 1
+    )  # sanity check to avoid division by zero in stable schedule
+    decay_steps = max(
+        decay_steps, 1
+    )  # sanity check to avoid division by zero in decay schedule
+
     lr_schedule = create_lr_schedule(
-        max_steps=max_steps,
-        warmup_steps=warmup_steps,
         peak_lr=peak_lr,
+        min_lr=min_lr,
+        warmup_steps=warmup_steps,
+        stable_steps=stable_steps,
+        decay_steps=decay_steps,
     )
 
     return optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay),
+        optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay, b1=b1, b2=b2),
     )
 
 
 # =============================================================================
 # 5. Training step
 # =============================================================================
+
 
 @nnx.jit
 def train_step(
@@ -223,7 +264,10 @@ def update_moe_biases(moe_layers: list[SparseMoE]) -> None:
 # 6. Checkpointing  (powered by Orbax)
 # =============================================================================
 
-def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.CheckpointManager:
+
+def make_checkpoint_manager(
+    ckpt_dir: str, max_to_keep: int = 3
+) -> ocp.CheckpointManager:
     """Create an Orbax CheckpointManager that keeps the last `max_to_keep` steps."""
     options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep)
     return ocp.CheckpointManager(pathlib.Path(ckpt_dir), options=options)
@@ -255,11 +299,11 @@ def load_latest_checkpoint(
     latest = manager.latest_step()
     if latest is None:
         return 0
-    
+
     abstract_model = nnx.eval_shape(
         lambda: NemotronNanoBlock(rngs=nnx.Rngs(0), config=config)
     )
-    
+
     _, abs_state = nnx.split(abstract_model)
     restored = manager.restore(latest, args=ocp.args.StandardRestore(abs_state))
     nnx.update(model, restored)
@@ -270,6 +314,7 @@ def load_latest_checkpoint(
 # =============================================================================
 # 7. Evaluation
 # =============================================================================
+
 
 def evaluate(
     model: NemotronNanoBlock,
@@ -286,13 +331,16 @@ def evaluate(
         total_loss += float(loss)
         count += 1
     mean_loss = total_loss / max(count, 1)
-    perplexity = math.exp(min(mean_loss, 20))   # clamp to avoid overflow on a fresh model
+    perplexity = math.exp(
+        min(mean_loss, 20)
+    )  # clamp to avoid overflow on a fresh model
     return mean_loss, perplexity
 
 
 # =============================================================================
 # 8. Generation
 # =============================================================================
+
 
 def generate(
     model: NemotronNanoBlock,
@@ -325,26 +373,25 @@ def generate(
         if not padded:  # guard: empty prompt → pad to one full chunk
             padded = [tokenizer.eos_token_id] * CHUNK_SIZE
 
-        input_ids = jnp.array([padded])          # (1, padded_len)
-        logits = model(input_ids)                # (1, padded_len, vocab_size)
-        next_logits = logits[0, -1, :]           # last position: (vocab_size,)
+        input_ids = jnp.array([padded])  # (1, padded_len)
+        logits = model(input_ids)  # (1, padded_len, vocab_size)
+        next_logits = logits[0, -1, :]  # last position: (vocab_size,)
 
         # Sample from the distribution scaled by temperature.
         rng, sample_rng = jax.random.split(rng)
-        next_token = int(
-            jax.random.categorical(sample_rng, next_logits / temperature)
-        )
+        next_token = int(jax.random.categorical(sample_rng, next_logits / temperature))
         tokens.append(next_token)
 
         if next_token == tokenizer.eos_token_id:
             break
 
-    return tokenizer.decode(tokens[len(prompt_tokens):])
+    return tokenizer.decode(tokens[len(prompt_tokens) :])
 
 
 # =============================================================================
 # 9. Chat loop
 # =============================================================================
+
 
 def chat(model: NemotronNanoBlock, tokenizer) -> None:
     print("\n--- Chat mode  (type 'quit' to exit) ---\n")
@@ -369,6 +416,7 @@ def chat(model: NemotronNanoBlock, tokenizer) -> None:
 # Main
 # =============================================================================
 
+
 def main() -> None:
     # ── 1. Tokenizer ──────────────────────────────────────────────────────────
     print("Loading Nemotron tokenizer ...")
@@ -384,26 +432,40 @@ def main() -> None:
     # validation so the two sets never overlap.
     # Increase max_samples for a longer/better training run.
     train_texts = load_raw_texts(max_samples=2000, skip=0)
-    val_texts   = load_raw_texts(max_samples=200,  skip=2000)
+    val_texts = load_raw_texts(max_samples=200, skip=2000)
 
     train_chunks = tokenize_and_pack(train_texts, tokenizer, SEQ_LEN)
-    val_chunks   = tokenize_and_pack(val_texts,   tokenizer, SEQ_LEN)
+    val_chunks = tokenize_and_pack(val_texts, tokenizer, SEQ_LEN)
     print(f"Train chunks: {len(train_chunks)},  Val chunks: {len(val_chunks)}")
 
     # ── 3. Model + optimizer ──────────────────────────────────────────────────
     print("\nBuilding model ...")
-    config     = NemotronConfig().from_preset("tiny")          # tiny defaults (d_model=128, etc.)
+    config = NemotronConfig().from_preset("tiny")  # tiny defaults (d_model=128, etc.)
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
 
-    model      = build_model(seed=0)
-    optimizer  = nnx.Optimizer(model, make_gradient_transform_optimizer(MAX_TRAIN_STEPS, WARMUP_STEPS, LEARNING_RATE), wrt=nnx.Param)
+    model = build_model(seed=0)
     moe_layers = collect_moe_layers(model)
+
+    optimizer = nnx.Optimizer(
+        model,
+        make_gradient_transform_optimizer(
+            PEAK_LR,
+            MIN_LR,
+            WARMUP_STEPS,
+            STABLE_STEPS,
+            DECAY_STEPS,
+            weight_decay=WEIGHT_DECAY,
+            b1=B1,
+            b2=B2,
+        ),
+        wrt=nnx.Param,
+    )
 
     # Create checkpoint manager; resume from the latest step if one exists.
     ckpt_manager = make_checkpoint_manager(CHECKPOINT_DIR)
-    start_step   = load_latest_checkpoint(ckpt_manager, model, config)
+    start_step = load_latest_checkpoint(ckpt_manager, model, config)
 
     # ── 4. Training loop ──────────────────────────────────────────────────────
     print(

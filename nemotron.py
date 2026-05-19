@@ -118,38 +118,38 @@ class NemotronConfig:
             return cls(
                 patterns=_default_patterns(),
             )
-        
+
         if key in ("kaggle", "colab"):
             return cls(
                 # Bigger model than tiny defaults.
-                patterns = [
-                    ("mamba_moe",         2),
+                patterns=[
+                    ("mamba_moe", 2),
                     ("mamba_attention_moe", 1),
-                    ("mamba_moe",         2),
+                    ("mamba_moe", 2),
                     ("mamba_attention_moe", 1),
-                    ("mamba_moe",         2),
+                    ("mamba_moe", 2),
                     ("mamba_attention_moe", 1),
-                    ("mamba_moe",         2),
+                    ("mamba_moe", 2),
                     ("mamba_attention_moe", 1),
-                    ("mamba_moe",         2),
+                    ("mamba_moe", 2),
                 ],
-                d_model              = 256,
+                d_model=256,
                 # Attention: 4 heads × 64 = 256 = d_model ✓
-                num_attention_heads  = 4,
-                attention_head_dim   = 64,
-                num_kv_heads         = 2,
+                num_attention_heads=4,
+                attention_head_dim=64,
+                num_kv_heads=2,
                 # Mamba: d_inner = 2 × 256 = 512, nheads = 8, ngroups = 2 — all divisible ✓
-                mamba_d_state        = 128,
-                mamba_expand         = 2,
-                mamba_headdim        = 64,
-                mamba_ngroups        = 2,
-                mamba_chunk_size     = 64,
+                mamba_d_state=128,
+                mamba_expand=2,
+                mamba_headdim=64,
+                mamba_ngroups=2,
+                mamba_chunk_size=64,
                 # MoE: more experts, wider hidden dim
-                num_experts          = 8,
-                num_shared_experts   = 1,
-                top_k                = 2,
-                expert_hidden_dim    = 512,
-                granularity_factor   = 1,
+                num_experts=8,
+                num_shared_experts=1,
+                top_k=2,
+                expert_hidden_dim=512,
+                granularity_factor=1,
             )
 
         if key in ("paper_close", "paper-close", "paper"):
