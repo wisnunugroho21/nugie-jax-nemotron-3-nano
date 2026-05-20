@@ -16,6 +16,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from cache import KVCache
+
 # =============================================================================
 # Attention Block
 # =============================================================================
@@ -151,3 +153,61 @@ class GroupedQueryAttention(nnx.Module):
         )
         out = self.out_proj(context)
         return out
+
+    def step(self, x: jax.Array, kv_cache: KVCache) -> tuple[jax.Array, KVCache]:
+        """
+        Single-token causal attention step with KV cache.
+
+        Computes Q/K/V for one new token, appends K/V to the cache, then attends
+        over all cached positions (causal mask keeps only valid filled slots).
+
+        Args:
+            x:        New token hidden state, shape (batch, d_model).
+            kv_cache: KVCache carrying accumulated keys/values from prior tokens.
+
+        Returns:
+            out:       Output tensor, shape (batch, d_model).
+            new_cache: Updated KVCache with the new token appended.
+        """
+        batch = x.shape[0]
+
+        # Project the new single token.
+        q = self.q_proj(x)  # (batch, num_query_heads * head_dim)
+        k = self.k_proj(x)  # (batch, num_kv_heads * head_dim)
+        v = self.v_proj(x)  # (batch, num_kv_heads * head_dim)
+
+        q = jnp.reshape(q, (batch, self.num_query_heads, self.head_dim))
+        k = jnp.reshape(k, (batch, self.num_kv_heads, self.head_dim))
+        v = jnp.reshape(v, (batch, self.num_kv_heads, self.head_dim))
+
+        # Append new K, V to the cache at the current fill position.
+        pos = kv_cache.length
+        new_k = jax.lax.dynamic_update_slice(
+            kv_cache.k, k[:, :, None, :], (0, 0, pos, 0)
+        )
+        new_v = jax.lax.dynamic_update_slice(
+            kv_cache.v, v[:, :, None, :], (0, 0, pos, 0)
+        )
+
+        # GQA: expand KV heads to match the number of query heads.
+        kv_repeat = self.num_query_heads // self.num_kv_heads
+        k_full = jnp.repeat(new_k, kv_repeat, axis=1)  # (batch, num_query_heads, max_len, head_dim)
+        v_full = jnp.repeat(new_v, kv_repeat, axis=1)
+
+        # q: (batch, num_query_heads, 1, head_dim) — single query token.
+        q = q[:, :, None, :]
+        scale = 1.0 / jnp.sqrt(self.head_dim)
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k_full) * scale  # (batch, h, 1, max_len)
+
+        # Causal mask: only attend to positions 0..pos (pos is the newly written slot).
+        max_len = kv_cache.k.shape[2]
+        valid = jnp.arange(max_len)[None, None, None, :] <= pos  # (1, 1, 1, max_len)
+        scores = jnp.where(valid, scores, -1e30)
+
+        attn = jax.nn.softmax(scores, axis=-1)
+        context = jnp.einsum("bhqk,bhkd->bhqd", attn, v_full)  # (batch, h, 1, head_dim)
+        context = jnp.reshape(
+            context[:, :, 0, :], (batch, self.num_query_heads * self.head_dim)
+        )
+        out = self.out_proj(context)
+        return out, KVCache(k=new_k, v=new_v, length=pos + 1)

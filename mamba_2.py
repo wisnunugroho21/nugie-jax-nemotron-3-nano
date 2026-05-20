@@ -25,6 +25,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from cache import SSMCache
+
 # =============================================================================
 # Core SSD Algorithm (Listing 1 from the paper)
 # =============================================================================
@@ -364,3 +366,88 @@ class Mamba2Block(nnx.Module):
 
         out = self.out_proj(y)
         return out
+
+    def step(self, u: jax.Array, ssm_cache: SSMCache) -> tuple[jax.Array, SSMCache]:
+        """
+        Single-token Mamba-2 recurrence step using cached SSM state.
+
+        Implements the per-token SSM recurrence:
+            h[t] = A_bar[t] * h[t-1]  +  B[t] ⊗ X[t]   (outer product over headdim × d_state)
+            y[t] = C[t] @ h[t]
+
+        The causal conv is applied by maintaining a (d_conv − 1)-length sliding window
+        (conv_buf) so no prior tokens need to be re-processed.
+
+        Args:
+            u:         New token input, shape (batch, d_model).
+            ssm_cache: SSMCache from the previous step (zero-initialized for step 0).
+
+        Returns:
+            out:       Output tensor, shape (batch, d_model).
+            new_cache: Updated SSMCache containing h[t] and the new conv_buf.
+        """
+        batch = u.shape[0]
+
+        # 1. Input projection for one token.
+        zxbcdt = self.in_proj(u)  # (batch, d_in_proj)
+        z, xBC, dt = jnp.split(
+            zxbcdt,
+            [self.d_inner, 2 * self.d_inner + 2 * self.ngroups * self.d_state],
+            axis=-1,
+        )
+        dt = jax.nn.softplus(dt + self.dt_bias.get_value())  # (batch, nheads)
+
+        # 2. Causal conv: slide the window by one and apply the depthwise filter.
+        # conv_buf holds the last (d_conv − 1) inputs, zero-initialized at step 0
+        # to match the left-zero-padding used in the full parallel forward pass.
+        new_conv_buf = jnp.concatenate(
+            [ssm_cache.conv_buf[:, 1:, :], xBC[:, None, :]], axis=1
+        )
+        x_window = jnp.concatenate(
+            [ssm_cache.conv_buf, xBC[:, None, :]], axis=1
+        )  # (batch, d_conv, conv_dim)
+
+        # Depthwise 1-D conv: kernel shape (d_conv, 1, conv_dim).
+        # For each channel c: out[b, c] = Σ_k x_window[b, k, c] * kernel[k, 0, c]
+        kernel = self.conv1d.kernel.get_value()  # (d_conv, 1, conv_dim)
+        xBC_conv = (
+            jnp.sum(x_window * kernel[:, 0, :][None], axis=1)
+            + self.conv1d.bias.get_value()
+        )  # (batch, conv_dim)
+        xBC_conv = jax.nn.silu(xBC_conv)
+
+        # 3. Split into x, B, C and restore head structure.
+        x, B, C = jnp.split(
+            xBC_conv,
+            [self.d_inner, self.d_inner + self.ngroups * self.d_state],
+            axis=-1,
+        )
+        x = jnp.reshape(x, (batch, self.nheads, self.headdim))
+        B = jnp.reshape(B, (batch, self.ngroups, self.d_state))
+        C = jnp.reshape(C, (batch, self.ngroups, self.d_state))
+
+        B = jnp.repeat(B, self.nheads // self.ngroups, axis=1)  # (batch, nheads, d_state)
+        C = jnp.repeat(C, self.nheads // self.ngroups, axis=1)
+
+        # 4. Single-step SSM recurrence.
+        A = -jnp.exp(self.A_log.get_value())    # (nheads,)       — continuous decay
+        A_bar = jnp.exp(A[None, :] * dt)        # (batch, nheads)  — discrete per-head scalar
+        X = x * dt[:, :, None]                  # (batch, nheads, headdim) — discretized input
+
+        # h[t] = A_bar * h[t-1]  +  X[t] ⊗ B[t]
+        new_h = (
+            A_bar[:, :, None, None] * ssm_cache.h      # (batch, nheads, headdim, d_state)
+            + jnp.einsum("bnh,bnd->bnhd", X, B)        # outer product: headdim × d_state
+        )
+
+        # y[t] = C[t] @ h[t]  →  (batch, nheads, headdim)
+        y = jnp.einsum("bnhd,bnd->bnh", new_h, C)
+        y = y + self.D.get_value()[None, :, None] * x  # D skip connection
+        y = jnp.reshape(y, (batch, self.d_inner))
+
+        # 5. Gate, norm, output projection (same as parallel path).
+        y = y * jax.nn.silu(z)
+        y = self.norm(y)
+        out = self.out_proj(y)
+
+        return out, SSMCache(h=new_h, conv_buf=new_conv_buf)

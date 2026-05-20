@@ -36,9 +36,11 @@ The Mamba + Attention + MoE hybrid is well-suited for this because:
 from dataclasses import dataclass, field
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 
 from attention import GroupedQueryAttention
+from cache import KVCache, SSMCache, NemotronCache
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
 
@@ -309,6 +311,27 @@ class MambaMoEBlock(nnx.Module):
         # MoE residual path.
         return x + self.moe(self.norm_moe(x))
 
+    def step(self, x: jax.Array, ssm_cache: SSMCache) -> tuple[jax.Array, SSMCache]:
+        """
+        Single-token step for MambaMoEBlock.
+
+        Runs one Mamba recurrence step and one MoE forward pass for a single
+        token position, reusing the cached SSM state from the previous step.
+
+        Args:
+            x:         Token hidden state, shape (batch, d_model).
+            ssm_cache: SSMCache from the previous step.
+
+        Returns:
+            out:           Updated hidden state, shape (batch, d_model).
+            new_ssm_cache: Updated SSMCache.
+        """
+        mamba_out, new_ssm_cache = self.mamba.step(self.norm_mamba(x), ssm_cache)
+        x = x + mamba_out
+        # MoE processes (batch, seqlen, d_model); add/remove the singleton seq dim.
+        x = x + self.moe(self.norm_moe(x)[:, None, :])[:, 0, :]
+        return x, new_ssm_cache
+
 
 # =============================================================================
 # Mamba Attention MoE Block
@@ -364,6 +387,35 @@ class MambaAttentionMoEBlock(nnx.Module):
 
         # MoE residual path.
         return x + self.moe(self.norm_moe(x))
+
+    def step(
+        self,
+        x: jax.Array,
+        ssm_cache: SSMCache,
+        kv_cache: KVCache,
+    ) -> tuple[jax.Array, SSMCache, KVCache]:
+        """
+        Single-token step for MambaAttentionMoEBlock.
+
+        Runs Mamba, GQA (with KV cache), and MoE for a single token position.
+
+        Args:
+            x:         Token hidden state, shape (batch, d_model).
+            ssm_cache: SSMCache from the previous step.
+            kv_cache:  KVCache carrying all prior key/value tensors.
+
+        Returns:
+            out:           Updated hidden state, shape (batch, d_model).
+            new_ssm_cache: Updated SSMCache.
+            new_kv_cache:  Updated KVCache with the new token appended.
+        """
+        mamba_out, new_ssm_cache = self.mamba.step(self.norm_mamba(x), ssm_cache)
+        x = x + mamba_out
+        attn_out, new_kv_cache = self.attention.step(self.norm_attention(x), kv_cache)
+        x = x + attn_out
+        # MoE processes (batch, seqlen, d_model); add/remove the singleton seq dim.
+        x = x + self.moe(self.norm_moe(x)[:, None, :])[:, 0, :]
+        return x, new_ssm_cache, new_kv_cache
 
 
 # =============================================================================
@@ -426,3 +478,113 @@ class NemotronNanoBlock(nnx.Module):
         logits = self.lm_head(x)
 
         return logits
+
+    # =========================================================================
+    # Cache-based single-token inference
+    # =========================================================================
+
+    def init_caches(
+        self,
+        batch_size: int,
+        max_attn_len: int,
+        dtype: jnp.dtype = jnp.float32,
+    ) -> NemotronCache:
+        """
+        Create zero-initialised caches for all blocks.
+
+        Call this once before the first step() invocation.  The returned
+        NemotronCache is then threaded through every subsequent step() call.
+
+        Args:
+            batch_size:   Number of sequences to process in parallel.
+            max_attn_len: Maximum number of tokens the KV cache can hold.
+                          Should be >= len(prompt_tokens) + max_new_tokens.
+            dtype:        Array dtype (e.g. jnp.bfloat16 to save memory).
+
+        Returns:
+            A NemotronCache with every SSM state and conv buffer zeroed and
+            every KV cache empty (length = 0).
+        """
+        cfg = self.config
+        d_inner = cfg.mamba_expand * cfg.d_model
+        nheads = d_inner // cfg.mamba_headdim
+        conv_dim = d_inner + 2 * cfg.mamba_ngroups * cfg.mamba_d_state
+
+        ssm_caches: list[SSMCache] = []
+        kv_caches: list[KVCache | None] = []
+
+        for block in self.blocks:
+            ssm_caches.append(
+                SSMCache(
+                    h=jnp.zeros(
+                        (batch_size, nheads, cfg.mamba_headdim, cfg.mamba_d_state),
+                        dtype=dtype,
+                    ),
+                    conv_buf=jnp.zeros(
+                        (batch_size, cfg.mamba_d_conv - 1, conv_dim),
+                        dtype=dtype,
+                    ),
+                )
+            )
+            if isinstance(block, MambaAttentionMoEBlock):
+                kv_caches.append(
+                    KVCache(
+                        k=jnp.zeros(
+                            (batch_size, cfg.num_kv_heads, max_attn_len, cfg.attention_head_dim),
+                            dtype=dtype,
+                        ),
+                        v=jnp.zeros(
+                            (batch_size, cfg.num_kv_heads, max_attn_len, cfg.attention_head_dim),
+                            dtype=dtype,
+                        ),
+                        length=jnp.zeros((), dtype=jnp.int32),
+                    )
+                )
+            else:
+                kv_caches.append(None)
+
+        return NemotronCache(ssm_caches=ssm_caches, kv_caches=kv_caches)
+
+    def step(
+        self,
+        token_id: jax.Array,
+        caches: NemotronCache,
+    ) -> tuple[jax.Array, NemotronCache]:
+        """
+        Single-token autoregressive step.
+
+        Processes one new token through the entire model using cached SSM
+        hidden states (for Mamba layers) and cached K/V tensors (for attention
+        layers), so each call is O(1) in sequence length rather than O(n).
+
+        Args:
+            token_id: Current token indices, shape (batch,).
+            caches:   NemotronCache from the previous step.
+                      Pass the result of init_caches() on the very first call.
+
+        Returns:
+            logits:     Output logits, shape (batch, vocab_size).
+            new_caches: Updated NemotronCache to pass to the next step().
+        """
+        x = self.embedding(token_id)  # (batch, d_model)
+
+        new_ssm_caches: list[SSMCache] = []
+        new_kv_caches: list[KVCache | None] = []
+
+        for i, block in enumerate(self.blocks):
+            ssm_cache = caches.ssm_caches[i]
+            kv_cache = caches.kv_caches[i]
+
+            if isinstance(block, MambaAttentionMoEBlock):
+                x, new_ssm, new_kv = block.step(x, ssm_cache, kv_cache)
+                new_ssm_caches.append(new_ssm)
+                new_kv_caches.append(new_kv)
+            else:
+                x, new_ssm = block.step(x, ssm_cache)
+                new_ssm_caches.append(new_ssm)
+                new_kv_caches.append(None)
+
+        x = self.final_norm(x)
+        logits = self.lm_head(x)  # (batch, vocab_size)
+
+        return logits, NemotronCache(ssm_caches=new_ssm_caches, kv_caches=new_kv_caches)

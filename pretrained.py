@@ -357,7 +357,7 @@ def generate(
     of CHUNK_SIZE before each forward pass.
 
     Note: this re-runs the full forward pass for every new token — simple and
-    correct, but not fast.  A production system would cache the SSM state.
+    correct, but not fast.  Prefer generate_with_cache() for efficient inference.
     """
     prompt_tokens = tokenizer.encode(prompt)
     tokens = list(prompt_tokens)
@@ -388,6 +388,76 @@ def generate(
     return tokenizer.decode(tokens[len(prompt_tokens) :])
 
 
+def generate_with_cache(
+    model: NemotronNanoBlock,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = MAX_GEN_TOKENS,
+    temperature: float = 0.8,
+    rng_seed: int = 42,
+    max_cache_len: int = MAX_CTX_LEN + MAX_GEN_TOKENS,
+) -> str:
+    """Efficient cache-based autoregressive text generation.
+
+    Maintains a KV cache (for attention layers) and an SSM state cache (for
+    Mamba layers) across steps.  Each new token therefore costs O(1) instead
+    of re-running the full context from scratch.
+
+    Generation has two phases:
+      1. Prefill  — step() through every prompt token to warm up the caches.
+      2. Sampling — generate new tokens one at a time, reusing cached state.
+
+    No chunk-size padding is required because step() processes one token at a
+    time rather than calling the parallel SSD algorithm.
+
+    Args:
+        model:          Trained NemotronNanoBlock.
+        tokenizer:      HuggingFace tokenizer.
+        prompt:         Input text prompt.
+        max_new_tokens: Maximum number of new tokens to generate.
+        temperature:    Sampling temperature (lower → more deterministic).
+        rng_seed:       PRNG seed for reproducible sampling.
+        max_cache_len:  KV cache capacity.  Must be ≥ len(prompt_tokens) +
+                        max_new_tokens.
+
+    Returns:
+        Generated text (the prompt itself is excluded).
+    """
+    prompt_tokens = tokenizer.encode(prompt)
+    if not prompt_tokens:
+        prompt_tokens = [tokenizer.eos_token_id]
+
+    rng = jax.random.PRNGKey(rng_seed)
+
+    # Initialise all caches to zero for the first step.
+    caches = model.init_caches(batch_size=1, max_attn_len=max_cache_len)
+
+    # ── Phase 1: prefill ──────────────────────────────────────────────────────
+    # Run every prompt token through step() so the SSM states and KV caches
+    # reflect the full prompt context.  The final call returns logits that
+    # predict the first generated token.
+    logits = None
+    for tok in prompt_tokens:
+        logits, caches = model.step(jnp.array([tok]), caches)
+
+    # ── Phase 2: sampling ─────────────────────────────────────────────────────
+    # At this point `logits` holds the distribution over the next token.
+    # We sample, append, then step() with the new token to get the next logits.
+    generated: list[int] = []
+    for _ in range(max_new_tokens):
+        next_logits = logits[0]  # (vocab_size,)
+        rng, sample_rng = jax.random.split(rng)
+        next_token = int(jax.random.categorical(sample_rng, next_logits / temperature))
+        generated.append(next_token)
+
+        if next_token == tokenizer.eos_token_id:
+            break
+
+        logits, caches = model.step(jnp.array([next_token]), caches)
+
+    return tokenizer.decode(generated)
+
+
 # =============================================================================
 # 9. Chat loop
 # =============================================================================
@@ -407,7 +477,7 @@ def chat(model: NemotronNanoBlock, tokenizer) -> None:
             break
         if not prompt:
             continue
-        response = generate(model, tokenizer, prompt, rng_seed=seed)
+        response = generate_with_cache(model, tokenizer, prompt, rng_seed=seed)
         seed += 1
         print(f"Model: {response}\n")
 
