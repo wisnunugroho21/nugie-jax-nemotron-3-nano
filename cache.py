@@ -57,3 +57,15 @@ class NemotronCache:
 
     ssm_caches: list[SSMCache]
     kv_caches: list[KVCache | None]
+
+
+# Register NemotronCache as a JAX pytree so it can be traced through jax.jit,
+# nnx.jit, and jax.lax.scan.  SSMCache and KVCache are NamedTuples and are
+# therefore already pytrees; None entries in kv_caches are valid empty leaves.
+jax.tree_util.register_pytree_node(
+    NemotronCache,
+    flatten_func=lambda c: ([c.ssm_caches, c.kv_caches], None),
+    unflatten_func=lambda _, children: NemotronCache(
+        ssm_caches=children[0], kv_caches=children[1]
+    ),
+)

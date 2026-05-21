@@ -39,9 +39,37 @@ Key design choices from the paper:
 The implementation is explicit and loop-based for readability, not performance.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+# =============================================================================
+# JIT-compiled bias update helper
+# =============================================================================
+
+
+@functools.partial(jax.jit, static_argnums=(2, 3))
+def _compute_updated_bias(
+    expert_bias: jax.Array,
+    topk_indices: jax.Array,
+    num_routed_experts: int,
+    routed_top_k: int,
+    bias_update_rate: float,
+) -> jax.Array:
+    """Pure-JAX expert bias update, compiled once per (num_routed_experts, routed_top_k) pair.
+
+    Keeping the arithmetic on-device avoids Python dispatch overhead when
+    update_expert_bias() is called after each training step.
+    """
+    num_tokens = topk_indices.shape[0]
+    actual_count = jnp.sum(
+        jax.nn.one_hot(topk_indices, num_routed_experts), axis=(0, 1)
+    )
+    expected_count = num_tokens * routed_top_k / num_routed_experts
+    return expert_bias - bias_update_rate * jnp.sign(actual_count - expected_count)
+
 
 # =============================================================================
 # Sparse MoE Block
@@ -317,15 +345,9 @@ class SparseMoE(nnx.Module):
         This is the core of the aux-loss-free load balancing strategy
         (Wang et al. 2024), as used in Nemotron 3 Nano (§2.4).
 
-        The idea is simple:
-          - Count how many tokens each expert received in this step.
-          - Compare to the ideal uniform count (tokens * top_k / num_experts).
-          - Decrease the bias of overloaded experts so they win fewer top-k races.
-          - Increase the bias of underloaded experts so they win more top-k races.
-
-        The update uses sign() instead of the actual count difference, so the
-        step size is always exactly +/- bias_update_rate regardless of how far
-        off-balance the expert is. This keeps the bias values small and stable.
+        Delegates to the module-level _compute_updated_bias which is
+        JIT-compiled once per (num_routed_experts, routed_top_k) pair,
+        keeping the arithmetic on-device and avoiding per-step Python overhead.
 
         IMPORTANT: Call this AFTER the optimizer step, outside the gradient tape.
         The expert_bias is NOT a gradient parameter — it must not be passed to
@@ -335,26 +357,14 @@ class SparseMoE(nnx.Module):
             topk_indices: (num_tokens, routed_top_k) from the last forward pass.
                           These are the expert indices that were selected.
         """
-        num_tokens = topk_indices.shape[0]
-
-        # Count how many tokens were routed to each expert.
-        # one_hot: (num_tokens, routed_top_k, num_routed_experts)
-        # sum over (tokens, top_k slots) → (num_routed_experts,)
-        actual_count = jnp.sum(
-            jax.nn.one_hot(topk_indices, self.num_routed_experts),
-            axis=(0, 1),
-        )
-
-        # The ideal count if all experts were equally loaded.
-        expected_count = num_tokens * self.routed_top_k / self.num_routed_experts
-
-        # sign(actual - expected):
-        #   +1 means overloaded  → subtract from bias → harder to pick next time
-        #   -1 means underloaded → add to bias        → easier to pick next time
-        #    0 means perfect     → no change
         self.expert_bias.set_value(
-            self.expert_bias.get_value()
-            - self.bias_update_rate * jnp.sign(actual_count - expected_count)
+            _compute_updated_bias(
+                self.expert_bias.get_value(),
+                topk_indices,
+                self.num_routed_experts,
+                self.routed_top_k,
+                self.bias_update_rate,
+            )
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:

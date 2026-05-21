@@ -298,12 +298,8 @@ class DotProductGroupedQueryAttention(nnx.Module):
         k = jnp.reshape(k, (batch, seqlen, self.num_kv_heads, self.head_dim))
         v = jnp.reshape(v, (batch, seqlen, self.num_kv_heads, self.head_dim))
 
-        # Expand KV heads to match query heads for GQA.
-        kv_repeat = self.num_query_heads // self.num_kv_heads
-        k = jnp.repeat(k, kv_repeat, axis=2)
-        v = jnp.repeat(v, kv_repeat, axis=2)
-
-        # Fused causal attention; scale is applied internally.
+        # jax.nn.dot_product_attention natively broadcasts when q_heads != kv_heads
+        # (GQA support, JAX >= 0.4.26) — no explicit repeat needed.
         context = jax.nn.dot_product_attention(q, k, v, is_causal=True)
         # context: (batch, seqlen, num_query_heads, head_dim)
 
@@ -342,14 +338,12 @@ class DotProductGroupedQueryAttention(nnx.Module):
             kv_cache.v, v[:, :, None, :], (0, 0, pos, 0)
         )
 
-        kv_repeat = self.num_query_heads // self.num_kv_heads
-        k_full = jnp.repeat(new_k, kv_repeat, axis=1)  # (batch, num_query_heads, max_len, head_dim)
-        v_full = jnp.repeat(new_v, kv_repeat, axis=1)
-
-        # Transpose from (batch, heads, seq, head_dim) to (batch, seq, heads, head_dim).
+        # Transpose KV cache from (batch, num_kv_heads, max_len, head_dim)
+        # to (batch, max_len, num_kv_heads, head_dim) for dot_product_attention.
+        # GQA broadcasting (q_heads != kv_heads) is handled natively — no repeat.
         q_dpa = q[:, None, :, :]                            # (batch, 1, num_query_heads, head_dim)
-        k_dpa = jnp.transpose(k_full, (0, 2, 1, 3))        # (batch, max_len, num_query_heads, head_dim)
-        v_dpa = jnp.transpose(v_full, (0, 2, 1, 3))        # (batch, max_len, num_query_heads, head_dim)
+        k_dpa = jnp.transpose(new_k, (0, 2, 1, 3))         # (batch, max_len, num_kv_heads, head_dim)
+        v_dpa = jnp.transpose(new_v, (0, 2, 1, 3))         # (batch, max_len, num_kv_heads, head_dim)
 
         # Causal mask: attend only to filled cache slots (0..pos).
         # mask shape must broadcast to (batch, num_heads, q_length, kv_length).

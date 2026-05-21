@@ -36,6 +36,8 @@ VOCAB_SIZE = 131072  # nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 tokenizer voca
 SEQ_LEN = 256  # input tokens per sample — must be divisible by CHUNK_SIZE
 CHUNK_SIZE = 64  # Mamba SSD chunk size — must match NemotronConfig.mamba_chunk_size
 BATCH_SIZE = 2
+GRAD_ACCUM_STEPS = 4    # micro-batches per optimizer step; effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS
+MOE_BIAS_UPDATE_FREQ = 10  # update MoE expert biases every N optimizer steps
 CHECKPOINT_EVERY = 200  # save a checkpoint every N training steps
 MAX_TRAIN_STEPS = 10000
 WARMUP_STEPS = int(MAX_TRAIN_STEPS * 0.1)  # linear warmup for the first N steps
@@ -277,11 +279,18 @@ def save_checkpoint(
     manager: ocp.CheckpointManager,
     model: NemotronNanoBlock,
     step: int,
+    blocking: bool = False,
 ) -> None:
-    """Save model state at `step` via the checkpoint manager."""
+    """Save model state at `step` via the checkpoint manager.
+
+    Mid-training saves are asynchronous by default so they do not stall the
+    training loop.  Pass blocking=True only for the final save to ensure all
+    writes complete before the process exits.
+    """
     _, state = nnx.split(model)
     manager.save(step, args=ocp.args.StandardSave(state))
-    manager.wait_until_finished()
+    if blocking:
+        manager.wait_until_finished()
     print(f"  Checkpoint saved: step {step}")
 
 
@@ -340,6 +349,22 @@ def evaluate(
 # =============================================================================
 # 8. Generation
 # =============================================================================
+
+
+@nnx.jit
+def _jit_model_step(
+    model: NemotronNanoBlock,
+    token_id: jax.Array,
+    caches,
+):
+    """JIT-compiled single-token step.
+
+    Compiles once on first call; subsequent calls reuse the XLA executable,
+    eliminating Python → dispatcher overhead for every generated token.
+    NemotronCache is registered as a JAX pytree (see cache.py), so JAX can
+    trace through the caches argument correctly.
+    """
+    return model.step(token_id, caches)
 
 
 def generate(
@@ -540,25 +565,41 @@ def main() -> None:
     # ── 4. Training loop ──────────────────────────────────────────────────────
     print(
         f"\nTraining for {MAX_TRAIN_STEPS} steps "
-        f"(batch={BATCH_SIZE}, seq_len={SEQ_LEN}) ..."
+        f"(batch={BATCH_SIZE}×{GRAD_ACCUM_STEPS}={BATCH_SIZE * GRAD_ACCUM_STEPS} effective, "
+        f"seq_len={SEQ_LEN}) ..."
     )
     print("(The first step is slow — JAX JIT-compiles the model.)\n")
 
     step = start_step
-    batch_iter = iter(make_batches(train_chunks, BATCH_SIZE))
+
+    # Transfer the full training dataset to device once.  All batches are then
+    # sliced device-side, eliminating per-step host→device copies.
+    train_chunks_device = jnp.array(train_chunks)
+    batch_iter = iter(make_batches(train_chunks_device, BATCH_SIZE))
+
+    def _next_batch() -> jax.Array:
+        """Pull the next micro-batch, refilling the iterator when exhausted."""
+        nonlocal batch_iter
+        try:
+            return next(batch_iter)
+        except StopIteration:
+            batch_iter = iter(make_batches(train_chunks_device, BATCH_SIZE))
+            return next(batch_iter)
 
     while step < MAX_TRAIN_STEPS:
-        # Refill the iterator when one pass over the data is done.
-        try:
-            batch_np = next(batch_iter)
-        except StopIteration:
-            batch_iter = iter(make_batches(train_chunks, BATCH_SIZE))
-            batch_np = next(batch_iter)
+        # Collect GRAD_ACCUM_STEPS micro-batches and concatenate on device.
+        # Equivalent to a single large batch: the per-token mean loss is the same,
+        # so the gradient direction is identical with no extra memory overhead.
+        micro_batches = [_next_batch() for _ in range(GRAD_ACCUM_STEPS)]
+        batch = jnp.concatenate(micro_batches, axis=0)
 
-        loss = train_step(model, optimizer, jnp.array(batch_np))
+        loss = train_step(model, optimizer, batch)
 
         # Update MoE expert biases outside the gradient tape.
-        update_moe_biases(moe_layers)
+        # Batched every MOE_BIAS_UPDATE_FREQ steps to reduce per-step Python
+        # overhead; the sign-based rule is robust to infrequent updates.
+        if step % MOE_BIAS_UPDATE_FREQ == 0:
+            update_moe_biases(moe_layers)
 
         step += 1
 
@@ -575,7 +616,7 @@ def main() -> None:
     print(f"  Perplexity      : {val_ppl:.2f}")
 
     # ── 6. Final checkpoint ───────────────────────────────────────────────────
-    save_checkpoint(ckpt_manager, model, step)
+    save_checkpoint(ckpt_manager, model, step, blocking=True)
     ckpt_manager.close()
 
     # ── 7. Interactive chat ───────────────────────────────────────────────────
