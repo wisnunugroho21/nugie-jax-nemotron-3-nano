@@ -810,9 +810,9 @@ def run_grpo_episode(
 # 7. Checkpointing  (identical pattern to finetune_cot.py)
 # =============================================================================
 
-def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.CheckpointManager:
+def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 1) -> ocp.CheckpointManager:
     """Create an Orbax CheckpointManager."""
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep)
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, overwrite=True)
     return ocp.CheckpointManager(pathlib.Path(ckpt_dir), options=options)
 
 

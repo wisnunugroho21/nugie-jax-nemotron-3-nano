@@ -548,9 +548,9 @@ def update_moe_biases(moe_layers: list[SparseMoE]) -> None:
 # 6. Checkpointing  (Orbax — same pattern as pretrained.py)
 # =============================================================================
 
-def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.CheckpointManager:
+def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 1) -> ocp.CheckpointManager:
     """Create an Orbax CheckpointManager that retains the last max_to_keep steps."""
-    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep)
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep, overwrite=True)
     return ocp.CheckpointManager(pathlib.Path(ckpt_dir), options=options)
 
 
