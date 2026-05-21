@@ -23,6 +23,22 @@ from cache import KVCache
 # =============================================================================
 
 
+def _maybe_raise_cache_overflow(pos: jax.Array, max_len: int) -> None:
+    """
+    Raises a clear error in eager mode when KV cache capacity is exceeded.
+
+    In traced/JIT mode `pos` may be a Tracer, so this check is skipped to keep
+    the step functions traceable.
+    """
+    if not isinstance(pos, jax.core.Tracer):
+        pos_int = int(pos)
+        if pos_int >= max_len:
+            raise ValueError(
+                f"KV cache is full (length={pos_int}, capacity={max_len}). "
+                "Increase max_attn_len when creating caches."
+            )
+
+
 class GroupedQueryAttention(nnx.Module):
     """
     Minimal causal self-attention with grouped-query heads.
@@ -182,6 +198,7 @@ class GroupedQueryAttention(nnx.Module):
 
         # Append new K, V to the cache at the current fill position.
         pos = kv_cache.length
+        _maybe_raise_cache_overflow(pos, kv_cache.k.shape[2])
         new_k = jax.lax.dynamic_update_slice(
             kv_cache.k, k[:, :, None, :], (0, 0, pos, 0)
         )
@@ -331,6 +348,7 @@ class DotProductGroupedQueryAttention(nnx.Module):
         v = jnp.reshape(v, (batch, self.num_kv_heads, self.head_dim))
 
         pos = kv_cache.length
+        _maybe_raise_cache_overflow(pos, kv_cache.k.shape[2])
         new_k = jax.lax.dynamic_update_slice(
             kv_cache.k, k[:, :, None, :], (0, 0, pos, 0)
         )

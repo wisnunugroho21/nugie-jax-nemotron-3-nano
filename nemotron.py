@@ -427,8 +427,7 @@ class NemotronNanoBlock(nnx.Module):
     Layout:
       token embedding -> N x NemotronBlock -> RMSNorm -> LM head
 
-        RoPE is applied inside attention blocks; there is no separate learned
-        positional embedding table.
+        No positional embedding table is used.
     """
 
     def __init__(self, rngs: nnx.Rngs, config: NemotronConfig):
