@@ -51,13 +51,10 @@ from moe import SparseMoE
 
 def _default_patterns() -> list[tuple[str, int]]:
     return [
-        ("mamba_moe", 2),
+        ("mamba_moe", 5),
         ("mamba_attention_moe", 1),
-        ("mamba_moe", 2),
+        ("mamba_moe", 5),
         ("mamba_attention_moe", 1),
-        ("mamba_moe", 2),
-        ("mamba_attention_moe", 1),
-        ("mamba_moe", 1),
     ]
 
 
@@ -72,14 +69,14 @@ class NemotronConfig:
     """
 
     # Token/model sizes
-    vocab_size: int = 1000
-    d_model: int = 128
+    vocab_size: int = 16000
+    d_model: int = 768
 
     patterns: list[tuple[str, int]] = field(default_factory=_default_patterns)
 
     # Attention (GQA)
     num_attention_heads: int = 4
-    num_kv_heads: int = 1
+    num_kv_heads: int = 2
     attention_head_dim: int = 32
 
     # Mamba-2 settings
@@ -91,9 +88,9 @@ class NemotronConfig:
     mamba_chunk_size: int = 64
 
     # MoE settings
-    num_experts: int = 4
+    num_experts: int = 8
     num_shared_experts: int = 1
-    top_k: int = 2
+    top_k: int = 1
     expert_hidden_dim: int = 256
     granularity_factor: int = 1
     scale_top_k_with_granularity: bool = True
