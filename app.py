@@ -1868,7 +1868,7 @@ def main() -> None:
             action_vocab_size=args.action_vocab_size,
         )
 
-        vision_tokens = (mm_config.image_size // mm_config.patch_size) ** 2
+        vision_tokens = mm_config.num_vision_tokens
         if vision_tokens >= args.seq_len:
             raise ValueError(
                 "For multimodal mode, seq_len must be larger than vision token count: "

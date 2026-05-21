@@ -20,22 +20,52 @@ from nemotron import (
     MambaMoEBlock,
     NemotronConfig,
 )
-from vision_encoder import VisionPatchEncoder
+from vision_encoder import RADIOVisionEncoder, pixel_shuffle_down
 
 
 @dataclass
 class NemotronMultimodalConfig(NemotronConfig):
-    """Configuration for multimodal Nemotron adapter."""
+    """
+    Configuration for multimodal Nemotron adapter.
+
+    Vision encoder defaults match C-RADIOv4-H (nvidia/C-RADIOv4-H), the
+    backbone used in the Nemotron 3 Nano Omni paper (arXiv:2604.24954).
+    """
 
     use_vision: bool = False
+
+    # Image resolution — used as the default/preferred size for preprocessing.
+    # The encoder supports any multiple-of-patch_size resolution (dynamic resolution).
     image_size: int = 224
-    patch_size: int = 16
-    vision_in_channels: int = 3
-    vision_dim: int = 256
-    vision_fusion: str = "prepend"  # supported: prepend, append
+
+    # ViT-H/16 architecture parameters (C-RADIOv4-H defaults).
+    patch_size: int = 16         # pixel width/height of each patch
+    vision_in_channels: int = 3  # RGB input
+    vision_dim: int = 1280       # encoder embed_dim (ViT-H)
+    vision_depth: int = 32       # number of transformer blocks (ViT-H)
+    vision_num_heads: int = 16   # attention heads per block (ViT-H)
+    vision_mlp_ratio: float = 4.0  # MLP hidden dim = vision_dim × this ratio
+
+    # Pixel-shuffle downsampling scale (2 → 2×2 blocks → 4× fewer tokens).
+    # Applied between the vision encoder and the LLM projection.
+    pixel_shuffle_scale: int = 2
+
+    vision_fusion: str = "prepend"  # how visual tokens are inserted: prepend | append
 
     use_action_head: bool = False
     action_vocab_size: int = 256
+
+    @property
+    def num_vision_tokens(self) -> int:
+        """
+        Number of visual tokens fed to the LLM for a single image_size × image_size image,
+        after pixel-shuffle downsampling.
+
+        Used by app.py to allocate sequence length budget.
+        """
+        patches_per_side = self.image_size // self.patch_size
+        downsampled_per_side = patches_per_side // self.pixel_shuffle_scale
+        return downsampled_per_side * downsampled_per_side
 
     def validate(self) -> None:
         super().validate()
@@ -48,8 +78,12 @@ class NemotronMultimodalConfig(NemotronConfig):
                 raise ValueError("image_size must be > 0")
             if self.patch_size <= 0:
                 raise ValueError("patch_size must be > 0")
-            if self.image_size % self.patch_size != 0:
-                raise ValueError("image_size must be divisible by patch_size")
+            stride = self.patch_size * self.pixel_shuffle_scale
+            if self.image_size % stride != 0:
+                raise ValueError(
+                    f"image_size must be divisible by patch_size × pixel_shuffle_scale "
+                    f"({self.patch_size} × {self.pixel_shuffle_scale} = {stride})"
+                )
             if self.vision_in_channels <= 0:
                 raise ValueError("vision_in_channels must be > 0")
             if self.vision_dim <= 0:
@@ -101,15 +135,21 @@ class NemotronMultimodal(nnx.Module):
         )
 
         if config.use_vision:
-            self.vision_encoder = VisionPatchEncoder(
+            # C-RADIOv4-H: ViT-H/16 with CPE, 32 blocks, embed_dim=1280.
+            self.vision_encoder = RADIOVisionEncoder(
                 rngs=rngs,
-                image_size=config.image_size,
                 patch_size=config.patch_size,
+                embed_dim=config.vision_dim,
+                depth=config.vision_depth,
+                num_heads=config.vision_num_heads,
+                mlp_ratio=config.vision_mlp_ratio,
                 in_channels=config.vision_in_channels,
-                vision_dim=config.vision_dim,
             )
+            # After pixel-shuffle (scale=2), each token has vision_dim * scale^2 channels.
+            # This projection maps that wider representation to the LLM's d_model.
+            ps = config.pixel_shuffle_scale
             self.vision_projection = nnx.Linear(
-                config.vision_dim,
+                config.vision_dim * ps * ps,
                 config.d_model,
                 use_bias=False,
                 rngs=rngs,
@@ -139,8 +179,18 @@ class NemotronMultimodal(nnx.Module):
         if not self.config.use_vision or pixel_values is None:
             return text_hidden, text_token_count
 
-        vision_tokens = self.vision_encoder(pixel_values)
-        vision_tokens = self.vision_projection(vision_tokens)
+        # Encode: returns global summary (CLS) and per-patch spatial features.
+        # h_patches / w_patches are needed to correctly perform pixel shuffle.
+        _summary, spatial, h_patches, w_patches = self.vision_encoder(pixel_values)
+
+        # Pixel-shuffle 4× downsampling: merge 2×2 patch blocks into one token.
+        # Reduces token count by 4 and widens channels by 4.
+        spatial = pixel_shuffle_down(
+            spatial, h_patches, w_patches, scale=self.config.pixel_shuffle_scale
+        )
+
+        # Project vision tokens to the LLM's hidden dimension.
+        vision_tokens = self.vision_projection(spatial)
 
         if self.config.vision_fusion == "prepend":
             fused = jnp.concatenate([vision_tokens, text_hidden], axis=1)
