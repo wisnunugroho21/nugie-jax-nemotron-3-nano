@@ -572,11 +572,11 @@ class NemotronNanoBlock(nnx.Module):
             ssm_cache = caches.ssm_caches[i]
             kv_cache = caches.kv_caches[i]
 
-            if isinstance(block, MambaAttentionMoEBlock):
+            if isinstance(block, MambaAttentionMoEBlock) and kv_cache is not None:
                 x, new_ssm, new_kv = block.step(x, ssm_cache, kv_cache)
                 new_ssm_caches.append(new_ssm)
                 new_kv_caches.append(new_kv)
-            else:
+            elif isinstance(block, MambaMoEBlock):
                 x, new_ssm = block.step(x, ssm_cache)
                 new_ssm_caches.append(new_ssm)
                 new_kv_caches.append(None)
