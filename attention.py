@@ -211,3 +211,157 @@ class GroupedQueryAttention(nnx.Module):
         )
         out = self.out_proj(context)
         return out, KVCache(k=new_k, v=new_v, length=pos + 1)
+
+
+# =============================================================================
+# Dot-Product Attention Block (uses jax.nn.dot_product_attention)
+# =============================================================================
+
+
+class DotProductGroupedQueryAttention(nnx.Module):
+    """
+    Causal GQA using jax.nn.dot_product_attention as the attention kernel.
+
+    Identical in behaviour to GroupedQueryAttention but delegates the
+    softmax + weighted-sum step to jax.nn.dot_product_attention, which XLA
+    can lower to an optimised fused kernel (e.g. Flash Attention) on supported
+    hardware. Requires JAX >= 0.4.20.
+
+    Args:
+        d_model: Hidden/model dimension.
+        num_query_heads: Number of query heads.
+        num_kv_heads: Number of key/value heads.
+        head_dim: Per-head channel dimension.
+    """
+
+    def __init__(
+        self,
+        rngs: nnx.Rngs,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ):
+        self.d_model = d_model
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+
+        assert self.num_query_heads % self.num_kv_heads == 0, (
+            "num_query_heads must be divisible by num_kv_heads for GQA"
+        )
+        assert self.num_query_heads * self.head_dim == self.d_model, (
+            "d_model must equal num_query_heads * head_dim"
+        )
+
+        self.q_proj = nnx.Linear(
+            self.d_model,
+            self.num_query_heads * self.head_dim,
+            use_bias=False,
+            rngs=rngs,
+        )
+        self.k_proj = nnx.Linear(
+            self.d_model,
+            self.num_kv_heads * self.head_dim,
+            use_bias=False,
+            rngs=rngs,
+        )
+        self.v_proj = nnx.Linear(
+            self.d_model,
+            self.num_kv_heads * self.head_dim,
+            use_bias=False,
+            rngs=rngs,
+        )
+        self.out_proj = nnx.Linear(
+            self.num_query_heads * self.head_dim,
+            self.d_model,
+            use_bias=False,
+            rngs=rngs,
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """
+        Args:
+            x: Token hidden states, shape (batch, seqlen, d_model)
+        Returns:
+            Output hidden states, shape (batch, seqlen, d_model)
+        """
+        batch, seqlen, d_model = x.shape
+        assert d_model == self.d_model, "Input d_model does not match module config"
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # jax.nn.dot_product_attention expects (batch, seq, heads, head_dim).
+        q = jnp.reshape(q, (batch, seqlen, self.num_query_heads, self.head_dim))
+        k = jnp.reshape(k, (batch, seqlen, self.num_kv_heads, self.head_dim))
+        v = jnp.reshape(v, (batch, seqlen, self.num_kv_heads, self.head_dim))
+
+        # Expand KV heads to match query heads for GQA.
+        kv_repeat = self.num_query_heads // self.num_kv_heads
+        k = jnp.repeat(k, kv_repeat, axis=2)
+        v = jnp.repeat(v, kv_repeat, axis=2)
+
+        # Fused causal attention; scale is applied internally.
+        context = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+        # context: (batch, seqlen, num_query_heads, head_dim)
+
+        context = jnp.reshape(
+            context, (batch, seqlen, self.num_query_heads * self.head_dim)
+        )
+        return self.out_proj(context)
+
+    def step(self, x: jax.Array, kv_cache: KVCache) -> tuple[jax.Array, KVCache]:
+        """
+        Single-token causal attention step with KV cache.
+
+        Args:
+            x:        New token hidden state, shape (batch, d_model).
+            kv_cache: KVCache carrying accumulated keys/values from prior tokens.
+
+        Returns:
+            out:       Output tensor, shape (batch, d_model).
+            new_cache: Updated KVCache with the new token appended.
+        """
+        batch = x.shape[0]
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = jnp.reshape(q, (batch, self.num_query_heads, self.head_dim))
+        k = jnp.reshape(k, (batch, self.num_kv_heads, self.head_dim))
+        v = jnp.reshape(v, (batch, self.num_kv_heads, self.head_dim))
+
+        pos = kv_cache.length
+        new_k = jax.lax.dynamic_update_slice(
+            kv_cache.k, k[:, :, None, :], (0, 0, pos, 0)
+        )
+        new_v = jax.lax.dynamic_update_slice(
+            kv_cache.v, v[:, :, None, :], (0, 0, pos, 0)
+        )
+
+        kv_repeat = self.num_query_heads // self.num_kv_heads
+        k_full = jnp.repeat(new_k, kv_repeat, axis=1)  # (batch, num_query_heads, max_len, head_dim)
+        v_full = jnp.repeat(new_v, kv_repeat, axis=1)
+
+        # Transpose from (batch, heads, seq, head_dim) to (batch, seq, heads, head_dim).
+        q_dpa = q[:, None, :, :]                            # (batch, 1, num_query_heads, head_dim)
+        k_dpa = jnp.transpose(k_full, (0, 2, 1, 3))        # (batch, max_len, num_query_heads, head_dim)
+        v_dpa = jnp.transpose(v_full, (0, 2, 1, 3))        # (batch, max_len, num_query_heads, head_dim)
+
+        # Causal mask: attend only to filled cache slots (0..pos).
+        # mask shape must broadcast to (batch, num_heads, q_length, kv_length).
+        max_len = kv_cache.k.shape[2]
+        valid = jnp.arange(max_len) <= pos                  # (max_len,)
+        mask = valid[None, None, None, :]                   # (1, 1, 1, max_len)
+
+        context = jax.nn.dot_product_attention(q_dpa, k_dpa, v_dpa, mask=mask)
+        # context: (batch, 1, num_query_heads, head_dim)
+
+        context = jnp.reshape(
+            context[:, 0, :, :], (batch, self.num_query_heads * self.head_dim)
+        )
+        out = self.out_proj(context)
+        return out, KVCache(k=new_k, v=new_v, length=pos + 1)

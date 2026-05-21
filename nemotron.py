@@ -39,7 +39,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from attention import GroupedQueryAttention
+from attention import DotProductGroupedQueryAttention
 from cache import KVCache, SSMCache, NemotronCache
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
@@ -355,7 +355,7 @@ class MambaAttentionMoEBlock(nnx.Module):
         # Reuse the already-implemented Mamba-2 block as the mixer.
         self.mamba = _build_mamba(config=config, rngs=rngs)
 
-        self.attention = GroupedQueryAttention(
+        self.attention = DotProductGroupedQueryAttention(
             d_model=config.d_model,
             num_query_heads=config.num_attention_heads,
             num_kv_heads=config.num_kv_heads,
