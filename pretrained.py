@@ -266,7 +266,7 @@ def update_moe_biases(moe_layers: list[SparseMoE]) -> None:
 
 
 def make_checkpoint_manager(
-    ckpt_dir: str, max_to_keep: int = 3
+    ckpt_dir: str, max_to_keep: int = 1
 ) -> ocp.CheckpointManager:
     """Create an Orbax CheckpointManager that keeps the last `max_to_keep` steps."""
     options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep)
@@ -280,7 +280,7 @@ def save_checkpoint(
 ) -> None:
     """Save model state at `step` via the checkpoint manager."""
     _, state = nnx.split(model)
-    manager.save(step, args=ocp.args.StandardSave(state))
+    manager.save(step, args=ocp.args.StandardSave(state), force=True)
     manager.wait_until_finished()
     print(f"  Checkpoint saved: step {step}")
 

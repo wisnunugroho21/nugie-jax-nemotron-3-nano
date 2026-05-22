@@ -810,7 +810,7 @@ def run_grpo_episode(
 # 7. Checkpointing  (identical pattern to finetune_cot.py)
 # =============================================================================
 
-def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 3) -> ocp.CheckpointManager:
+def make_checkpoint_manager(ckpt_dir: str, max_to_keep: int = 1) -> ocp.CheckpointManager:
     """Create an Orbax CheckpointManager."""
     options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep)
     return ocp.CheckpointManager(pathlib.Path(ckpt_dir), options=options)
@@ -823,7 +823,7 @@ def save_checkpoint(
 ) -> None:
     """Serialise model weights to disk at the given training step."""
     _, state = nnx.split(model)
-    manager.save(step, args=ocp.args.StandardSave(state))
+    manager.save(step, args=ocp.args.StandardSave(state), force=True)
     manager.wait_until_finished()
     print(f"  Checkpoint saved: step {step}")
 
