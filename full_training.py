@@ -199,6 +199,10 @@ RLVR_CKPT_EVERY      = 50
 # Max cache length must exceed prompt length + RLVR_MAX_NEW_TOKENS.
 RLVR_MAX_CACHE_LEN   = SFT_SEQ_LEN + RLVR_MAX_NEW_TOKENS + 64
 
+# RL losses use token_ids[:, :-1] as model inputs. To keep that input length
+# divisible by CHUNK_SIZE for Mamba, the packed RL sequence length is +1.
+RL_TRAIN_SEQ_LEN     = SFT_SEQ_LEN + 1
+
 
 # =============================================================================
 # POST-TRAINING — RLHF Hyperparameters
@@ -240,6 +244,7 @@ RLHF_MAX_CACHE_LEN   = SFT_SEQ_LEN + 200 + 64
 assert PRETRAIN_SEQ_LEN % CHUNK_SIZE == 0, "PRETRAIN_SEQ_LEN must divide CHUNK_SIZE"
 assert LC_SEQ_LEN       % CHUNK_SIZE == 0, "LC_SEQ_LEN must divide CHUNK_SIZE"
 assert SFT_SEQ_LEN      % CHUNK_SIZE == 0, "SFT_SEQ_LEN must divide CHUNK_SIZE"
+assert (RL_TRAIN_SEQ_LEN - 1) % CHUNK_SIZE == 0, "RL_TRAIN_SEQ_LEN - 1 must divide CHUNK_SIZE"
 
 
 # =============================================================================
@@ -258,6 +263,12 @@ def build_model(seed: int = 0) -> NemotronNanoBlock:
     the full config (d_model=4096, num_experts=128, top_k=6, …).
     """
     config = NemotronConfig.from_preset("tiny")
+    # Keep this file robust across config updates: some presets may drift and
+    # violate attention shape constraints (d_model != heads * head_dim).
+    # We enforce a valid tiny shape here so full_training.py is runnable.
+    expected_d_model = config.num_attention_heads * config.attention_head_dim
+    if config.d_model != expected_d_model:
+        config.d_model = expected_d_model
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
@@ -363,39 +374,41 @@ def make_constant_lr_optimizer(
 
 
 def compute_load_balance_loss(moe_layers: list[SparseMoE]) -> jax.Array:
-    """Compute a frequency-based MoE load-balancing auxiliary loss.
+    """Compute MoE load-balancing auxiliary loss.
 
     Paper §2.4: load-balancing loss coefficient 1e-4.
     The full paper loss is L_lb = num_experts × Σ_i f_i × P_i where f_i is
     the expert token fraction and P_i is the mean router probability.
 
-    The current SparseMoE implementation stores only `last_topk_indices`
-    (not router probabilities), so we use a variance-based proxy that is
-    equivalent in intent: penalise deviation from uniform expert usage.
-
-        L_proxy = num_experts × Σ_i f_i²
-
-    This is differentiable through the routing counts (treated as soft
-    targets) and achieves the same effect of encouraging balanced load.
-    For the full f × P form, add `last_router_probs` to SparseMoE.
+    If router probabilities are unavailable, we fall back to a frequency-only
+    proxy L_proxy = num_experts × Σ_i f_i².
     """
     total_loss = jnp.zeros(())
     for moe in moe_layers:
-        # last_topk_indices shape: (batch, seq_len, top_k)
+        # SparseMoE stores top-k indices as (num_tokens, routed_top_k).
+        # Some variants may store (batch, seq, top_k); both are handled here.
         indices = moe.last_topk_indices.get_value()
-        if indices is None:
+        if indices is None or indices.size == 0:
             continue
-        num_experts = moe.num_experts
-        B, S, K = indices.shape
+        num_experts = moe.num_routed_experts
+        if indices.ndim not in (2, 3):
+            raise ValueError(f"Unexpected top-k index shape: {indices.shape}")
 
         # f_i: fraction of all (token, slot) assignments going to expert i.
         # We count each of the K slots independently (standard MoE convention).
-        flat_indices = indices.reshape(-1)                            # (B*S*K,)
+        flat_indices = indices.reshape(-1)
         one_hot = jax.nn.one_hot(flat_indices, num_experts)          # (B*S*K, E)
         f = one_hot.mean(axis=0)                                      # (E,)
 
-        # Variance-based load-balance loss: encourage f to be uniform (1/E each).
-        # Scaling by num_experts makes the magnitude comparable to the f×P form.
+        # Standard paper term if router probabilities are available.
+        if hasattr(moe, "last_router_probs"):
+            router_probs = moe.last_router_probs.get_value()
+            if router_probs is not None and router_probs.size > 0:
+                P = router_probs.mean(axis=0)
+                total_loss = total_loss + num_experts * (f * P).sum()
+                continue
+
+        # Fallback proxy when P_i is unavailable.
         total_loss = total_loss + num_experts * (f * f).sum()
 
     return total_loss / max(len(moe_layers), 1)
@@ -673,6 +686,7 @@ def sft_loss(
     inputs: jax.Array,
     labels: jax.Array,
     mask: jax.Array,
+    moe_layers: list[SparseMoE] | None = None,
 ) -> jax.Array:
     """Masked cross-entropy for supervised fine-tuning.
 
@@ -689,7 +703,13 @@ def sft_loss(
 
     masked_sum   = (ce * mask).sum()
     unmasked_cnt = jnp.maximum(mask.sum(), 1.0)   # prevent division by zero
-    return masked_sum / unmasked_cnt
+    sft_ce_loss = masked_sum / unmasked_cnt
+
+    # Paper §3.1.6 keeps MoE load balancing active during SFT.
+    if moe_layers is None:
+        return sft_ce_loss
+    lb_loss = compute_load_balance_loss(moe_layers)
+    return sft_ce_loss + AUX_LOSS_COEFF * lb_loss
 
 
 # =============================================================================
@@ -722,9 +742,11 @@ def sft_step(
     labels: jax.Array,
     mask: jax.Array,
 ) -> jax.Array:
-    """Single SFT gradient update.  Returns the masked cross-entropy loss."""
+    """Single SFT gradient update.  Returns total SFT loss."""
+    moe_layers = collect_moe_layers(model)
+
     def _loss_fn(m):
-        return sft_loss(m, inputs, labels, mask)
+        return sft_loss(m, inputs, labels, mask, moe_layers)
 
     loss, grads = nnx.value_and_grad(_loss_fn, argnums=nnx.DiffState(0, nnx.Param))(model)
     optimizer.update(model, grads)
@@ -844,7 +866,7 @@ def run_pretrain_phase1(model: NemotronNanoBlock, tokenizer) -> None:
         b1=PRETRAIN_B1,
         b2=PRETRAIN_B2,
     )
-    optimizer  = nnx.Optimizer(model, tx)
+    optimizer  = nnx.Optimizer(model, tx, wrt=nnx.Param)
     moe_layers = collect_moe_layers(model)
     ckpt_mgr   = make_checkpoint_manager(PRETRAIN_CKPT_DIR)
 
@@ -921,7 +943,7 @@ def run_pretrain_phase2(model: NemotronNanoBlock, tokenizer) -> None:
         b1=PRETRAIN_B1,
         b2=PRETRAIN_B2,
     )
-    optimizer  = nnx.Optimizer(model, tx)
+    optimizer  = nnx.Optimizer(model, tx, wrt=nnx.Param)
     moe_layers = collect_moe_layers(model)
     ckpt_mgr   = make_checkpoint_manager(PRETRAIN_CKPT_DIR)
 
@@ -980,7 +1002,7 @@ def run_lc_phase(model: NemotronNanoBlock, tokenizer) -> None:
 
     # Constant LR for the LC-Phase — no warmup or decay.
     tx         = make_constant_lr_optimizer(LC_PHASE_LR, PRETRAIN_WD, PRETRAIN_B1, PRETRAIN_B2)
-    optimizer  = nnx.Optimizer(model, tx)
+    optimizer  = nnx.Optimizer(model, tx, wrt=nnx.Param)
     moe_layers = collect_moe_layers(model)
     ckpt_mgr   = make_checkpoint_manager(PRETRAIN_CKPT_DIR)
 
@@ -1035,8 +1057,9 @@ def run_sft(model: NemotronNanoBlock, tokenizer) -> None:
         b1=SFT_B1,
         b2=SFT_B2,
     )
-    optimizer = nnx.Optimizer(model, tx)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     ckpt_mgr  = make_checkpoint_manager(SFT_CKPT_DIR)
+    moe_layers = collect_moe_layers(model)
 
     step = 0
     while step < SFT_STEPS:
@@ -1046,6 +1069,7 @@ def run_sft(model: NemotronNanoBlock, tokenizer) -> None:
             if step >= SFT_STEPS:
                 break
             loss = sft_step(model, optimizer, inputs, labels, mask)
+            update_moe_biases(moe_layers)
             step += 1
 
             if step % 50 == 0:
@@ -1055,7 +1079,7 @@ def run_sft(model: NemotronNanoBlock, tokenizer) -> None:
                 for vinputs, vlabels, vmask in make_sft_batches(
                     val_samples, tokenizer, SFT_BATCH, SFT_SEQ_LEN
                 ):
-                    val_loss += float(sft_loss(model, vinputs, vlabels, vmask))
+                    val_loss += float(sft_loss(model, vinputs, vlabels, vmask, moe_layers))
                     val_count += 1
                     if val_count >= 10:
                         break
@@ -1253,10 +1277,10 @@ def build_grpo_batch(
 
 def grpo_loss(
     model: NemotronNanoBlock,
-    ref_model: NemotronNanoBlock,
     token_ids: jax.Array,
     masks: jax.Array,
     advantages: jax.Array,
+    ref_log_probs: jax.Array,
     kl_coeff: float = RLVR_KL_COEFF,
 ) -> jax.Array:
     """GRPO objective: policy gradient + unbiased KL penalty.
@@ -1276,16 +1300,14 @@ def grpo_loss(
     masks_  = masks[:, 1:]          # shift to align with targets
 
     logits_policy = model(inputs)   # (B*G, seq-1, vocab)
-    logits_ref    = ref_model(inputs)
-
     log_pi_policy = jax.nn.log_softmax(logits_policy, axis=-1)
-    log_pi_ref    = jax.nn.log_softmax(logits_ref,    axis=-1)
+    log_p_policy = jnp.take_along_axis(
+        log_pi_policy, targets[:, :, None], axis=-1
+    )[:, :, 0]
 
-    # Gather log-probabilities for the tokens that were actually generated.
-    B, T, V = logits_policy.shape
-    flat_targets   = targets.reshape(-1)
-    log_p_policy   = log_pi_policy.reshape(-1, V)[jnp.arange(B * T), flat_targets].reshape(B, T)
-    log_p_ref      = log_pi_ref.   reshape(-1, V)[jnp.arange(B * T), flat_targets].reshape(B, T)
+    # `ref_log_probs` is computed outside the gradient tape so gradients flow
+    # only through the policy model.
+    log_p_ref = ref_log_probs
 
     # Policy gradient term: -A_j × log π_θ(t)
     pg_loss = -(advantages[:, None] * log_p_policy)   # (B*G, T)
@@ -1303,19 +1325,39 @@ def grpo_loss(
 @nnx.jit
 def rlvr_step(
     model: NemotronNanoBlock,
-    ref_model: NemotronNanoBlock,
     optimizer: nnx.Optimizer,
     token_ids: jax.Array,
     masks: jax.Array,
     advantages: jax.Array,
+    ref_log_probs: jax.Array,
 ) -> jax.Array:
     """Single GRPO gradient update for RLVR.  Returns the scalar loss."""
     def _loss_fn(m):
-        return grpo_loss(m, ref_model, token_ids, masks, advantages)
+        return grpo_loss(m, token_ids, masks, advantages, ref_log_probs)
 
     loss, grads = nnx.value_and_grad(_loss_fn, argnums=nnx.DiffState(0, nnx.Param))(model)
     optimizer.update(model, grads)
     return loss
+
+
+def compute_ref_log_probs(ref_model: NemotronNanoBlock, token_ids: jax.Array) -> jax.Array:
+    """Compute reference-policy token log-probs outside the gradient tape."""
+    inputs = token_ids[:, :-1]
+    targets = token_ids[:, 1:]
+    logits_ref = ref_model(inputs)
+    log_pi_ref = jax.nn.log_softmax(logits_ref, axis=-1)
+    return jnp.take_along_axis(log_pi_ref, targets[:, :, None], axis=-1)[:, :, 0]
+
+
+def snapshot_router_kernels(moe_layers: list[SparseMoE]) -> list[jax.Array]:
+    """Copy router kernels so they can be restored after an optimizer step."""
+    return [moe.router.kernel.get_value() for moe in moe_layers]
+
+
+def restore_router_kernels(moe_layers: list[SparseMoE], kernels: list[jax.Array]) -> None:
+    """Restore router kernels to enforce router freezing during RLVR."""
+    for moe, kernel in zip(moe_layers, kernels):
+        moe.router.kernel.set_value(kernel)
 
 
 def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
@@ -1339,18 +1381,14 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
     print("\n=== Post-Training Step 2: RLVR (GRPO) ===")
 
     train_samples = load_sft_data("train")
+    moe_layers = collect_moe_layers(model)
 
     # ── Freeze MoE router weights (paper §3.2.5) ─────────────────────────────
     # Router weights are frozen during RL to stabilise training: the expert
     # routing pattern learned during pretraining / SFT is preserved, and only
-    # the expert MLP weights and attention weights are updated.
-    if RLVR_FREEZE_ROUTER:
-        for moe in collect_moe_layers(model):
-            # Mark router params as non-differentiable by tagging them.
-            # In a full framework (NeMo-RL) this is done via parameter groups.
-            # Here we annotate for clarity; full implementation would modify
-            # the optimizer's parameter filter.
-            pass   # NOTE: full router freezing requires optax.masked()
+    # the expert MLP weights and attention weights are updated. In this simple
+    # implementation we enforce freezing by restoring router kernels after each
+    # optimizer step.
 
     # Keep a frozen copy of the SFT model as the reference policy for KL.
     # The reference is never updated — it acts as an anchor to prevent the
@@ -1359,7 +1397,7 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
     ref_model = nnx.merge(graphdef, ref_state)   # deep copy
 
     tx        = make_constant_lr_optimizer(RLVR_LR, RLVR_WD, RLVR_B1, RLVR_B2)
-    optimizer = nnx.Optimizer(model, tx)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     ckpt_mgr  = make_checkpoint_manager(RLVR_CKPT_DIR)
 
     # Estimate initial pass-rates for curriculum sampling.
@@ -1394,8 +1432,9 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
 
                 # Overlong filtering (§3.2.5): discard completions that hit the
                 # length cap — they indicate the model is "overthinking" and
-                # should not receive a positive gradient signal.
+                # should not receive a gradient signal.
                 if len(comp_ids) >= RLVR_MAX_NEW_TOKENS:
+                    comp_ids = []  # fully discarded from policy gradient (mask=0)
                     rewards.append(0.0)
                 else:
                     comp_text = tokenizer.decode(comp_ids, skip_special_tokens=True)
@@ -1412,12 +1451,16 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
         # ── Build training batch and take a gradient step ─────────────────────
         token_ids, masks, advantages = build_grpo_batch(
             prompt_ids_list, completion_groups, advantage_groups,
-            seq_len=SFT_SEQ_LEN, pad_id=tokenizer.eos_token_id,
+            seq_len=RL_TRAIN_SEQ_LEN, pad_id=tokenizer.eos_token_id,
         )
-        loss = rlvr_step(model, ref_model, optimizer, token_ids, masks, advantages)
+        ref_log_probs = compute_ref_log_probs(ref_model, token_ids)
+        router_kernels_before = snapshot_router_kernels(moe_layers) if RLVR_FREEZE_ROUTER else None
+        loss = rlvr_step(model, optimizer, token_ids, masks, advantages, ref_log_probs)
+        if router_kernels_before is not None:
+            restore_router_kernels(moe_layers, router_kernels_before)
 
         # Update MoE expert biases (aux-loss-free, §2.4).
-        update_moe_biases(collect_moe_layers(model))
+        update_moe_biases(moe_layers)
 
         # Update pass-rate estimates for curriculum sampling.
         for i, (sample, rewards) in enumerate(zip(batch_samples, reward_groups)):
@@ -1606,7 +1649,7 @@ def run_rlhf(model: NemotronNanoBlock, tokenizer) -> None:
     ref_model = nnx.merge(graphdef, ref_state)
 
     tx        = make_constant_lr_optimizer(RLHF_LR, RLHF_WD, RLHF_B1, RLHF_B2)
-    optimizer = nnx.Optimizer(model, tx)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     ckpt_mgr  = make_checkpoint_manager(RLHF_CKPT_DIR)
 
     for step in range(RLHF_STEPS):
@@ -1652,9 +1695,10 @@ def run_rlhf(model: NemotronNanoBlock, tokenizer) -> None:
         advantage_groups = [compute_grpo_advantages(rg) for rg in reward_groups]
         token_ids, masks, advantages = build_grpo_batch(
             prompt_ids_list, completion_groups, advantage_groups,
-            seq_len=SFT_SEQ_LEN, pad_id=tokenizer.eos_token_id,
+            seq_len=RL_TRAIN_SEQ_LEN, pad_id=tokenizer.eos_token_id,
         )
-        loss = rlvr_step(model, ref_model, optimizer, token_ids, masks, advantages)
+        ref_log_probs = compute_ref_log_probs(ref_model, token_ids)
+        loss = rlvr_step(model, optimizer, token_ids, masks, advantages, ref_log_probs)
         update_moe_biases(collect_moe_layers(model))
 
         if step % 10 == 0:

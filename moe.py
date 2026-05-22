@@ -187,6 +187,11 @@ class SparseMoE(nnx.Module):
         self.last_topk_indices = nnx.Variable(
             jnp.zeros((1, self.routed_top_k), dtype=jnp.int32)
         )
+        # Stores per-token sigmoid router probabilities from the most recent
+        # forward pass. Shape at runtime: (num_tokens, num_routed_experts).
+        self.last_router_probs = nnx.Variable(
+            jnp.zeros((1, self.num_routed_experts), dtype=jnp.float32)
+        )
 
         # Router: a single linear layer mapping each token to one logit per routed expert.
         # No bias per paper. Shared experts are NOT routed — they bypass this.
@@ -398,6 +403,7 @@ class SparseMoE(nnx.Module):
         routed_scores = jax.nn.sigmoid(
             routed_logits
         )  # (num_tokens, num_routed_experts)
+        self.last_router_probs.set_value(routed_scores)
 
         # Step 3 (aux-loss-free): Add the expert bias to scores before top-k selection.
         # The bias is learned over time: underloaded experts accumulate a positive bias
