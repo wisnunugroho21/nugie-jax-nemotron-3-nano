@@ -177,6 +177,7 @@ RLVR_STEPS           = 100  # number of GRPO gradient updates
 # The KL coefficient β prevents the policy from drifting too far from the
 # SFT checkpoint (the "reference model").
 RLVR_KL_COEFF        = 0.04   # same as finetune_cot_rl.py
+RLVR_CLIP_EPS        = 0.2    # PPO/GRPO clipping epsilon (paper §3.2.5)
 
 # Paper §3.2.5: max generation length 49 K; overlong filtering is applied.
 RLVR_MAX_NEW_TOKENS  = 150    # paper: 49 000 (reduced for demo)
@@ -1281,17 +1282,24 @@ def grpo_loss(
     masks: jax.Array,
     advantages: jax.Array,
     ref_log_probs: jax.Array,
+    old_log_probs: jax.Array,
     kl_coeff: float = RLVR_KL_COEFF,
+    clip_eps: float = RLVR_CLIP_EPS,
 ) -> jax.Array:
-    """GRPO objective: policy gradient + unbiased KL penalty.
+    """GRPO objective: clipped-ratio policy gradient + unbiased KL penalty.
 
-    For each response token t at position i in sequence j the loss is:
-        L_j(t) = −A_j · log π_θ(t | context)
+    For each completion token t in sequence j the loss is:
+        L_j(t) = −min(r_t · A_j,  clip(r_t, 1−ε, 1+ε) · A_j)
                + β · (exp(δ_t) − δ_t − 1)    ← unbiased KL (always ≥ 0)
-    where δ_t = log π_ref(t) − log π_θ(t).
+    where:
+        r_t  = π_θ(t) / π_old(t)  — importance-sampling ratio
+        δ_t  = log π_ref(t) − log π_θ(t)
+        ε    = clip_eps (PPO-style trust-region clipping)
 
-    Averaging over completion tokens only (mask == 1.0) and over all
-    sequences gives the batch GRPO loss.
+    `old_log_probs` are the per-token log-probs from the policy that
+    generated the completions (computed before the gradient step, outside
+    the gradient tape).  `ref_log_probs` come from the fixed SFT reference
+    model used for the KL anchor.
 
     Reference: Shao et al. (2024), DeepSeek-AI (2025), §3.2.5 of the paper.
     """
@@ -1305,15 +1313,18 @@ def grpo_loss(
         log_pi_policy, targets[:, :, None], axis=-1
     )[:, :, 0]
 
-    # `ref_log_probs` is computed outside the gradient tape so gradients flow
-    # only through the policy model.
-    log_p_ref = ref_log_probs
+    # Importance-sampling ratio π_θ / π_old.
+    # `old_log_probs` is computed outside the gradient tape so it acts as a
+    # constant denominator; gradients flow only through log_p_policy.
+    ratio = jnp.exp(log_p_policy - old_log_probs)     # (B*G, T)
 
-    # Policy gradient term: -A_j × log π_θ(t)
-    pg_loss = -(advantages[:, None] * log_p_policy)   # (B*G, T)
+    # Clipped surrogate policy gradient (PPO/GRPO objective).
+    adv = advantages[:, None]                          # (B*G, 1) → broadcast
+    clipped_ratio = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+    pg_loss = -jnp.minimum(ratio * adv, clipped_ratio * adv)  # (B*G, T)
 
     # Unbiased KL penalty: e^δ − δ − 1  where δ = log π_ref − log π_θ
-    delta   = log_p_ref - log_p_policy
+    delta   = ref_log_probs - log_p_policy
     kl_pen  = jnp.exp(delta) - delta - 1.0            # (B*G, T)
 
     total_loss = pg_loss + kl_coeff * kl_pen           # (B*G, T)
@@ -1330,10 +1341,11 @@ def rlvr_step(
     masks: jax.Array,
     advantages: jax.Array,
     ref_log_probs: jax.Array,
+    old_log_probs: jax.Array,
 ) -> jax.Array:
     """Single GRPO gradient update for RLVR.  Returns the scalar loss."""
     def _loss_fn(m):
-        return grpo_loss(m, token_ids, masks, advantages, ref_log_probs)
+        return grpo_loss(m, token_ids, masks, advantages, ref_log_probs, old_log_probs)
 
     loss, grads = nnx.value_and_grad(_loss_fn, argnums=nnx.DiffState(0, nnx.Param))(model)
     optimizer.update(model, grads)
@@ -1454,8 +1466,9 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
             seq_len=RL_TRAIN_SEQ_LEN, pad_id=tokenizer.eos_token_id,
         )
         ref_log_probs = compute_ref_log_probs(ref_model, token_ids)
+        old_log_probs = compute_ref_log_probs(model, token_ids)   # policy before update
         router_kernels_before = snapshot_router_kernels(moe_layers) if RLVR_FREEZE_ROUTER else None
-        loss = rlvr_step(model, optimizer, token_ids, masks, advantages, ref_log_probs)
+        loss = rlvr_step(model, optimizer, token_ids, masks, advantages, ref_log_probs, old_log_probs)
         if router_kernels_before is not None:
             restore_router_kernels(moe_layers, router_kernels_before)
 
