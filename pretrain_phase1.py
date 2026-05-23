@@ -9,7 +9,6 @@ Run standalone:
     python pretrain_phase1.py
 """
 
-import jax.numpy as jnp
 from flax import nnx
 from transformers import AutoTokenizer
 
@@ -82,7 +81,7 @@ def run_pretrain_phase1(model: NemotronNanoBlock, tokenizer) -> None:
         for batch_np in make_batches(train_chunks, PRETRAIN_BATCH):
             if step >= PHASE1_STEPS:
                 break
-            batch = jnp.array(batch_np)
+            batch = batch_np
             loss  = pretrain_step(model, optimizer, batch)
 
             # Aux-loss-free bias update runs outside the gradient tape.

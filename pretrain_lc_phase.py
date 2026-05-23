@@ -12,7 +12,6 @@ Run standalone:
 Resumes from the latest pretrain checkpoint in PRETRAIN_CKPT_DIR if available.
 """
 
-import jax.numpy as jnp
 from flax import nnx
 from transformers import AutoTokenizer
 
@@ -63,7 +62,7 @@ def run_lc_phase(model: NemotronNanoBlock, tokenizer) -> None:
         for batch_np in make_batches(lc_chunks, PRETRAIN_BATCH):
             if step >= LC_PHASE_STEPS:
                 break
-            batch = jnp.array(batch_np)
+            batch = batch_np
             loss  = pretrain_step(model, optimizer, batch)
             update_moe_biases(moe_layers)
             step += 1
