@@ -173,6 +173,7 @@ SFT_CKPT_EVERY   = 100
 RLVR_NUM_PROMPTS     = 4    # paper: 128
 RLVR_NUM_GENERATIONS = 4    # paper: 16  — completions per prompt
 RLVR_STEPS           = 100  # number of GRPO gradient updates
+RLVR_BATCH_STEPS     = 4    # paper: 2 048 / (128×16) = 1 step per batch; use smaller for demo
 
 # The KL coefficient β prevents the policy from drifting too far from the
 # SFT checkpoint (the "reference model").
@@ -322,7 +323,7 @@ def make_wsd_schedule(
     )
 
 
-def make_adamw_optimizer(
+def make_decayed_lr_optimizer(
     peak_lr: float,
     min_lr: float,
     warmup_steps: int,
@@ -857,7 +858,7 @@ def run_pretrain_phase1(model: NemotronNanoBlock, tokenizer) -> None:
     )
 
     # ── Optimizer: AdamW + WSD LR schedule ──────────────────────────────────
-    tx = make_adamw_optimizer(
+    tx = make_decayed_lr_optimizer(
         peak_lr=PRETRAIN_PEAK_LR,
         min_lr=PRETRAIN_MIN_LR,
         warmup_steps=PRETRAIN_WARMUP_STEPS,
@@ -934,7 +935,7 @@ def run_pretrain_phase2(model: NemotronNanoBlock, tokenizer) -> None:
     phase2_stable = max(1, PHASE2_STEPS // 2)
     phase2_decay  = max(1, PHASE2_STEPS - phase2_warmup - phase2_stable)
 
-    tx = make_adamw_optimizer(
+    tx = make_decayed_lr_optimizer(
         peak_lr=PRETRAIN_PEAK_LR,
         min_lr=PRETRAIN_MIN_LR,
         warmup_steps=phase2_warmup,
@@ -1048,7 +1049,7 @@ def run_sft(model: NemotronNanoBlock, tokenizer) -> None:
     val_samples   = load_sft_data("test")
 
     # SFT uses a short warmup then a constant (no-decay) LR.
-    tx = make_adamw_optimizer(
+    tx = make_decayed_lr_optimizer(
         peak_lr=SFT_LR,
         min_lr=SFT_MIN_LR,
         warmup_steps=SFT_WARMUP_STEPS,
@@ -1334,7 +1335,7 @@ def grpo_loss(
 
 
 @nnx.jit
-def rlvr_step(
+def rl_step(
     model: NemotronNanoBlock,
     optimizer: nnx.Optimizer,
     token_ids: jax.Array,
@@ -1342,18 +1343,22 @@ def rlvr_step(
     advantages: jax.Array,
     ref_log_probs: jax.Array,
     old_log_probs: jax.Array,
-) -> jax.Array:
+) -> float:
     """Single GRPO gradient update for RLVR.  Returns the scalar loss."""
     def _loss_fn(m):
         return grpo_loss(m, token_ids, masks, advantages, ref_log_probs, old_log_probs)
+    
+    avg_loss = 0.0
+    for _ in range(RLVR_BATCH_STEPS):
+        loss, grads = nnx.value_and_grad(_loss_fn, argnums=nnx.DiffState(0, nnx.Param))(model)
+        optimizer.update(model, grads)
+        avg_loss += loss
 
-    loss, grads = nnx.value_and_grad(_loss_fn, argnums=nnx.DiffState(0, nnx.Param))(model)
-    optimizer.update(model, grads)
-    return loss
+    return avg_loss / RLVR_BATCH_STEPS
 
 
-def compute_ref_log_probs(ref_model: NemotronNanoBlock, token_ids: jax.Array) -> jax.Array:
-    """Compute reference-policy token log-probs outside the gradient tape."""
+def compute_log_probs(ref_model: NemotronNanoBlock, token_ids: jax.Array) -> jax.Array:
+    """Compute policy token log-probs outside the gradient tape."""
     inputs = token_ids[:, :-1]
     targets = token_ids[:, 1:]
     logits_ref = ref_model(inputs)
@@ -1465,10 +1470,10 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
             prompt_ids_list, completion_groups, advantage_groups,
             seq_len=RL_TRAIN_SEQ_LEN, pad_id=tokenizer.eos_token_id,
         )
-        ref_log_probs = compute_ref_log_probs(ref_model, token_ids)
-        old_log_probs = compute_ref_log_probs(model, token_ids)   # policy before update
+        ref_log_probs = compute_log_probs(ref_model, token_ids)
+        old_log_probs = compute_log_probs(model, token_ids)   # policy before update
         router_kernels_before = snapshot_router_kernels(moe_layers) if RLVR_FREEZE_ROUTER else None
-        loss = rlvr_step(model, optimizer, token_ids, masks, advantages, ref_log_probs, old_log_probs)
+        loss = rl_step(model, optimizer, token_ids, masks, advantages, ref_log_probs, old_log_probs)
         if router_kernels_before is not None:
             restore_router_kernels(moe_layers, router_kernels_before)
 
@@ -1482,7 +1487,7 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
 
         if step % 10 == 0:
             mean_reward = float(np.mean([r for rg in reward_groups for r in rg]))
-            print(f"  RLVR step {step:3d} | loss={float(loss):.4f} | "
+            print(f"  RLVR step {step:3d} | loss={loss:.4f} | "
                   f"mean_reward={mean_reward:.3f}")
 
         if step % RLVR_CKPT_EVERY == 0:
@@ -1710,13 +1715,14 @@ def run_rlhf(model: NemotronNanoBlock, tokenizer) -> None:
             prompt_ids_list, completion_groups, advantage_groups,
             seq_len=RL_TRAIN_SEQ_LEN, pad_id=tokenizer.eos_token_id,
         )
-        ref_log_probs = compute_ref_log_probs(ref_model, token_ids)
-        loss = rlvr_step(model, optimizer, token_ids, masks, advantages, ref_log_probs)
+        ref_log_probs = compute_log_probs(ref_model, token_ids)
+        old_log_probs = compute_log_probs(model, token_ids)   # policy before update
+        loss = rl_step(model, optimizer, token_ids, masks, advantages, ref_log_probs, old_log_probs)
         update_moe_biases(collect_moe_layers(model))
 
         if step % 10 == 0:
             mean_score = float(np.mean([s for rg in reward_groups for s in rg]))
-            print(f"  RLHF step {step:3d} | loss={float(loss):.4f} | "
+            print(f"  RLHF step {step:3d} | loss={loss:.4f} | "
                   f"mean_genrm_score={mean_score:.3f}")
 
         if step % RLHF_CKPT_EVERY == 0:

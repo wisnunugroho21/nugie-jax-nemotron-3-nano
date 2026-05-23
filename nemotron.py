@@ -308,7 +308,7 @@ class MambaMoEBlock(nnx.Module):
         # MoE residual path.
         return x + self.moe(self.norm_moe(x))
 
-    def step(self, x: jax.Array, ssm_cache: SSMCache) -> tuple[jax.Array, SSMCache]:
+    def step_chached(self, x: jax.Array, ssm_cache: SSMCache) -> tuple[jax.Array, SSMCache]:
         """
         Single-token step for MambaMoEBlock.
 
@@ -323,7 +323,7 @@ class MambaMoEBlock(nnx.Module):
             out:           Updated hidden state, shape (batch, d_model).
             new_ssm_cache: Updated SSMCache.
         """
-        mamba_out, new_ssm_cache = self.mamba.step(self.norm_mamba(x), ssm_cache)
+        mamba_out, new_ssm_cache = self.mamba.step_chached(self.norm_mamba(x), ssm_cache)
         x = x + mamba_out
         # MoE processes (batch, seqlen, d_model); add/remove the singleton seq dim.
         x = x + self.moe(self.norm_moe(x)[:, None, :])[:, 0, :]
@@ -406,9 +406,9 @@ class MambaAttentionMoEBlock(nnx.Module):
             new_ssm_cache: Updated SSMCache.
             new_kv_cache:  Updated KVCache with the new token appended.
         """
-        mamba_out, new_ssm_cache = self.mamba.step(self.norm_mamba(x), ssm_cache)
+        mamba_out, new_ssm_cache = self.mamba.step_chached(self.norm_mamba(x), ssm_cache)
         x = x + mamba_out
-        attn_out, new_kv_cache = self.attention.step(self.norm_attention(x), kv_cache)
+        attn_out, new_kv_cache = self.attention.step_chached(self.norm_attention(x), kv_cache)
         x = x + attn_out
         # MoE processes (batch, seqlen, d_model); add/remove the singleton seq dim.
         x = x + self.moe(self.norm_moe(x)[:, None, :])[:, 0, :]
@@ -577,7 +577,7 @@ class NemotronNanoBlock(nnx.Module):
                 new_ssm_caches.append(new_ssm)
                 new_kv_caches.append(new_kv)
             elif isinstance(block, MambaMoEBlock):
-                x, new_ssm = block.step(x, ssm_cache)
+                x, new_ssm = block.step_chached(x, ssm_cache)
                 new_ssm_caches.append(new_ssm)
                 new_kv_caches.append(None)
 

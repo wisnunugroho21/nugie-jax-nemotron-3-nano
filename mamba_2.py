@@ -367,7 +367,7 @@ class Mamba2Block(nnx.Module):
         out = self.out_proj(y)
         return out
 
-    def step(self, u: jax.Array, ssm_cache: SSMCache) -> tuple[jax.Array, SSMCache]:
+    def step_chached(self, u: jax.Array, ssm_cache: SSMCache) -> tuple[jax.Array, SSMCache]:
         """
         Single-token Mamba-2 recurrence step using cached SSM state.
 

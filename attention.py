@@ -312,7 +312,7 @@ class DotProductGroupedQueryAttention(nnx.Module):
         )
         return self.out_proj(context)
 
-    def step(self, x: jax.Array, kv_cache: KVCache) -> tuple[jax.Array, KVCache]:
+    def step_chached(self, x: jax.Array, kv_cache: KVCache) -> tuple[jax.Array, KVCache]:
         """
         Single-token causal attention step with KV cache.
 
