@@ -17,7 +17,6 @@ import optax
 import orbax.checkpoint as ocp
 from datasets import load_dataset
 from flax import nnx
-from transformers import AutoTokenizer
 
 from moe import SparseMoE
 from nemotron import NemotronConfig, NemotronNanoBlock
@@ -669,6 +668,31 @@ def compute_grpo_advantages(rewards: list[float]) -> np.ndarray:
     return (r - r.mean()) / (r.std() + 1e-6)
 
 
+def curriculum_sample_indices(
+    pass_rates: np.ndarray,
+    step: int,
+    total_steps: int,
+    batch_size: int,
+) -> np.ndarray:
+    """Return sample indices according to the curriculum schedule (§3.2.2)."""
+    if len(pass_rates) == 0:
+        raise ValueError("pass_rates must not be empty.")
+
+    target_difficulty = 0.3 + 0.4 * (step / max(total_steps, 1))
+    difficulties = 1.0 - pass_rates
+
+    weights = np.exp(-0.5 * ((difficulties - target_difficulty) / 0.2) ** 2).astype(np.float64)
+    total_weight = float(weights.sum())
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        weights = np.full_like(weights, 1.0 / len(weights))
+    else:
+        weights /= total_weight
+
+    replace = batch_size > len(pass_rates)
+    chosen_idx = np.random.choice(len(pass_rates), size=batch_size, replace=replace, p=weights)
+    return chosen_idx
+
+
 def curriculum_sample(
     samples: list[dict],
     pass_rates: np.ndarray,
@@ -677,13 +701,12 @@ def curriculum_sample(
     batch_size: int,
 ) -> list[dict]:
     """Sample tasks according to the curriculum schedule from §3.2.2."""
-    target_difficulty = 0.3 + 0.4 * (step / max(total_steps, 1))
-    difficulties = 1.0 - pass_rates
-
-    weights = np.exp(-0.5 * ((difficulties - target_difficulty) / 0.2) ** 2)
-    weights = weights / weights.sum()
-
-    chosen_idx = np.random.choice(len(samples), size=batch_size, replace=False, p=weights)
+    chosen_idx = curriculum_sample_indices(
+        pass_rates=pass_rates,
+        step=step,
+        total_steps=total_steps,
+        batch_size=batch_size,
+    )
     return [samples[i] for i in chosen_idx]
 
 

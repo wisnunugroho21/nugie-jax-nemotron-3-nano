@@ -44,7 +44,7 @@ from training_shared import (
     generate_completion_tokens,
     compute_verifiable_reward,
     compute_grpo_advantages,
-    curriculum_sample,
+    curriculum_sample_indices,
     build_grpo_batch,
     rl_step,
     compute_log_probs,
@@ -92,9 +92,13 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
     pass_rates = np.full(len(train_samples), 0.5, dtype=np.float32)
 
     for step in range(RLVR_STEPS):
-        batch_samples = curriculum_sample(
-            train_samples, pass_rates, step, RLVR_STEPS, RLVR_NUM_PROMPTS
+        batch_indices = curriculum_sample_indices(
+            pass_rates=pass_rates,
+            step=step,
+            total_steps=RLVR_STEPS,
+            batch_size=RLVR_NUM_PROMPTS,
         )
+        batch_samples = [train_samples[i] for i in batch_indices]
 
         prompt_ids_list: list[list[int]] = []
         completion_groups: list[list[list[int]]] = []
@@ -144,9 +148,10 @@ def run_rlvr(model: NemotronNanoBlock, tokenizer) -> None:
         update_moe_biases(moe_layers)
 
         # Update per-sample pass-rate estimates for next curriculum step.
-        for sample, rewards in zip(batch_samples, reward_groups):
-            idx = train_samples.index(sample)
-            pass_rates[idx] = float(np.mean([r > 0 for r in rewards]))
+        pass_rates[batch_indices] = np.array(
+            [float(np.mean(np.array(rewards) > 0.0)) for rewards in reward_groups],
+            dtype=np.float32,
+        )
 
         if step % 10 == 0:
             mean_reward = float(np.mean([r for rg in reward_groups for r in rg]))

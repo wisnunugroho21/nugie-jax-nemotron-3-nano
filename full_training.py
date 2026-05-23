@@ -64,10 +64,8 @@ Paper reference
 from transformers import AutoTokenizer
 
 from training_shared import (
-    PRETRAIN_CKPT_DIR,
     RLVR_CKPT_DIR,
     build_model,
-    try_load_from_dir,
 )
 from pretrain_phase1   import run_pretrain_phase1
 from pretrain_phase2   import run_pretrain_phase2
@@ -106,7 +104,6 @@ def main() -> None:
     # ── Model ──────────────────────────────────────────────────────────────
     print("Building model …")
     model  = build_model(seed=0)
-    config = model.config   # keep a reference for checkpoint restoration
 
     # ── Pre-Training ───────────────────────────────────────────────────────
     # Paper §2: 25 T token pretraining in two phases + long-context extension.

@@ -167,6 +167,7 @@ def run_rlhf(model: NemotronNanoBlock, tokenizer) -> None:
     print("\n=== Post-Training Step 3: RLHF with GenRM ===")
 
     train_samples = load_sft_data("train")
+    moe_layers = collect_moe_layers(model)
 
     # Frozen copy of the RLVR checkpoint as reference policy for KL penalty.
     graphdef, ref_state = nnx.split(model)
@@ -217,7 +218,7 @@ def run_rlhf(model: NemotronNanoBlock, tokenizer) -> None:
         ref_log_probs = compute_log_probs(ref_model, token_ids)
         old_log_probs = compute_log_probs(model, token_ids)
         loss = rl_step(model, optimizer, token_ids, masks, advantages, ref_log_probs, old_log_probs)
-        update_moe_biases(collect_moe_layers(model))
+        update_moe_biases(moe_layers)
 
         if step % 10 == 0:
             mean_score = float(np.mean([s for rg in reward_groups for s in rg]))
