@@ -32,7 +32,8 @@ from nemotron import NemotronConfig, NemotronNanoBlock
 
 def _setup_mesh() -> Mesh:
     """Create a 1-D data-parallel device mesh over all available devices."""
-    return jax.make_mesh((len(jax.devices()), ), ('data'))
+    devices = np.array(jax.devices())
+    return Mesh(devices, axis_names=("data",))
 
 
 MESH: Mesh = _setup_mesh()
