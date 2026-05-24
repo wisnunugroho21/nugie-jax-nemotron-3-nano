@@ -17,64 +17,9 @@ import optax
 import orbax.checkpoint as ocp
 from datasets import load_dataset
 from flax import nnx
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from moe import SparseMoE
 from nemotron import NemotronConfig, NemotronNanoBlock
-
-
-# =============================================================================
-# Multi-device (data-parallel) Setup
-# =============================================================================
-# The mesh maps every available accelerator onto a single "data" axis.
-# On 1 device this is a no-op; on N devices each training step receives
-# batch/N samples and XLA inserts the necessary all-reduce for gradients.
-
-def _setup_mesh() -> Mesh:
-    """Create a 1-D data-parallel device mesh over all available devices."""
-    devices = np.array(jax.devices())
-    return Mesh(devices, axis_names=("data",))
-
-
-MESH: Mesh = _setup_mesh()
-_DATA_SHARDING: NamedSharding = NamedSharding(MESH, P("data"))
-_REPLICATED_SHARDING: NamedSharding = NamedSharding(MESH, P())
-NUM_DEVICES: int = len(jax.devices())
-
-
-def shard_batch(arr) -> jax.Array:
-    """Place a (batch, ...) array on all devices, sharded along the batch axis.
-
-    The batch dimension must be divisible by NUM_DEVICES.  When NUM_DEVICES==1
-    this is equivalent to a plain ``jnp.asarray`` call.
-    """
-    arr = jnp.asarray(arr)
-    if arr.shape[0] % NUM_DEVICES != 0:
-        raise ValueError(
-            f"Batch size {arr.shape[0]} must be divisible by NUM_DEVICES "
-            f"({NUM_DEVICES}).  Multiply your batch-size constant by "
-            f"{NUM_DEVICES} (or a multiple) so each device gets at least "
-            f"one sample."
-        )
-    return jax.device_put(arr, _DATA_SHARDING)
-
-
-def _replicate_to_devices(model: NemotronNanoBlock) -> None:
-    """Replicate model parameters to all devices in-place.
-
-    After this call every variable in ``model`` is backed by a replicated
-    ``jax.Array`` (``NamedSharding(MESH, P())``) so that data-parallel
-    training steps compiled by XLA can see consistent weights on every device.
-    On a single device this is a cheap no-op.
-    """
-    if NUM_DEVICES == 1:
-        return
-    graphdef, state = nnx.split(model)
-    state = jax.tree_util.tree_map(
-        lambda x: jax.device_put(x, _REPLICATED_SHARDING), state
-    )
-    nnx.update(model, state)
-    print(f"  Model replicated across {NUM_DEVICES} devices: {jax.devices()}")
 
 
 # =============================================================================
@@ -209,7 +154,7 @@ assert (RL_TRAIN_SEQ_LEN - 1) % CHUNK_SIZE == 0, "RL_TRAIN_SEQ_LEN - 1 must divi
 
 
 def build_model(seed: int = 0) -> NemotronNanoBlock:
-    """Construct a tiny Nemotron model replicated across all available devices."""
+    """Construct a tiny Nemotron model for local experimentation."""
     config = NemotronConfig.from_preset("tiny")
     expected_d_model = config.num_attention_heads * config.attention_head_dim
     if config.d_model != expected_d_model:
@@ -217,9 +162,7 @@ def build_model(seed: int = 0) -> NemotronNanoBlock:
     config.vocab_size = VOCAB_SIZE
     config.mamba_chunk_size = CHUNK_SIZE
     config.validate()
-    model = NemotronNanoBlock(rngs=nnx.Rngs(seed), config=config)
-    _replicate_to_devices(model)
-    return model
+    return NemotronNanoBlock(rngs=nnx.Rngs(seed), config=config)
 
 
 def collect_moe_layers(model: NemotronNanoBlock) -> list[SparseMoE]:
@@ -369,11 +312,11 @@ def load_pretrain_data(
 
 
 def make_batches(chunks: np.ndarray, batch_size: int):
-    """Shuffle chunks once, then yield (batch_size, chunk_len) sharded batches."""
+    """Shuffle chunks once, then yield (batch_size, chunk_len) batches."""
     idx = np.random.permutation(len(chunks))
     chunks = chunks[idx]
     for i in range(0, len(chunks) - batch_size + 1, batch_size):
-        yield shard_batch(chunks[i : i + batch_size])
+        yield chunks[i : i + batch_size]
 
 
 def load_sft_data(split: str = "train") -> list[dict]:
@@ -490,9 +433,9 @@ def make_sft_batches(samples: list[dict], tokenizer, batch_size: int, seq_len: i
     for start in range(0, len(stacked_inputs) - batch_size + 1, batch_size):
         end = start + batch_size
         yield (
-            shard_batch(stacked_inputs[start:end]),
-            shard_batch(stacked_labels[start:end]),
-            shard_batch(stacked_masks [start:end]),
+            jnp.array(stacked_inputs[start:end]),
+            jnp.array(stacked_labels[start:end]),
+            jnp.array(stacked_masks [start:end]),
         )
 
 
@@ -641,7 +584,7 @@ def evaluate_pretrain(
     for batch_np in make_batches(val_chunks, PRETRAIN_BATCH):
         if count >= val_steps:
             break
-        loss = float(pretrain_loss(model, batch_np, moe_layers))
+        loss = float(pretrain_loss(model, jnp.array(batch_np), moe_layers))
         total_loss += loss
         count += 1
     mean_loss = total_loss / max(count, 1)
@@ -797,9 +740,9 @@ def build_grpo_batch(
             all_advantages.append(float(adv))
 
     return (
-        shard_batch(np.stack(all_tokens)),
-        shard_batch(np.stack(all_masks)),
-        shard_batch(np.array(all_advantages, dtype=np.float32)),
+        jnp.array(np.stack(all_tokens)),
+        jnp.array(np.stack(all_masks)),
+        jnp.array(np.array(all_advantages, dtype=np.float32)),
     )
 
 
@@ -862,7 +805,6 @@ def rl_step(
     return avg_loss / RLVR_BATCH_STEPS
 
 
-@nnx.jit
 def compute_log_probs(ref_model: NemotronNanoBlock, token_ids: jax.Array) -> jax.Array:
     """Compute policy token log-probs outside the gradient tape."""
     inputs = token_ids[:, :-1]

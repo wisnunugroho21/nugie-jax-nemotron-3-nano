@@ -13,6 +13,7 @@ Resumes automatically from the latest Phase 1 / Phase 2 checkpoint in
 PRETRAIN_CKPT_DIR if one exists.
 """
 
+import jax.numpy as jnp
 from flax import nnx
 from transformers import AutoTokenizer
 
@@ -84,7 +85,7 @@ def run_pretrain_phase2(model: NemotronNanoBlock, tokenizer) -> None:
         for batch_np in make_batches(train_chunks, PRETRAIN_BATCH):
             if step >= PHASE2_STEPS:
                 break
-            batch = batch_np
+            batch = jnp.array(batch_np)
             loss  = pretrain_step(model, optimizer, batch)
             update_moe_biases(moe_layers)
             step += 1
