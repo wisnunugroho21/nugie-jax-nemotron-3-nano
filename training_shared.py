@@ -17,15 +17,28 @@ import optax
 import orbax.checkpoint as ocp
 from datasets import load_dataset
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from device_mesh import MESH, NUM_DEVICES, DATA_SHARDING, REPLICATED_SHARDING
 from moe import SparseMoE
 from nemotron import NemotronConfig, NemotronNanoBlock
 
-# Aliases kept for internal use; device_mesh.py is the single source of truth.
-_DATA_SHARDING: NamedSharding = DATA_SHARDING
-_REPLICATED_SHARDING: NamedSharding = REPLICATED_SHARDING
+
+# =============================================================================
+# Multi-device (data-parallel) Setup
+# =============================================================================
+# The mesh maps every available accelerator onto a single "data" axis.
+# On 1 device this is a no-op; on N devices each training step receives
+# batch/N samples and XLA inserts the necessary all-reduce for gradients.
+
+def _setup_mesh() -> Mesh:
+    """Create a 1-D data-parallel device mesh over all available devices."""
+    return jax.make_mesh((len(jax.devices()), ), ('data'))
+
+
+MESH: Mesh = _setup_mesh()
+_DATA_SHARDING: NamedSharding = NamedSharding(MESH, P("data"))
+_REPLICATED_SHARDING: NamedSharding = NamedSharding(MESH, P())
+NUM_DEVICES: int = len(jax.devices())
 
 
 def shard_batch(arr) -> jax.Array:

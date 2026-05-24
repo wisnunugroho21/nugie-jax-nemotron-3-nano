@@ -38,11 +38,9 @@ from dataclasses import dataclass, field
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
 
 from attention import DotProductGroupedQueryAttention
 from cache import KVCache, SSMCache, NemotronCache
-from device_mesh import MESH
 from mamba_2 import Mamba2Block
 from moe import SparseMoE
 
@@ -468,14 +466,7 @@ class NemotronNanoBlock(nnx.Module):
         # The model sees the full thinking trace as part of the supervised target.
         # It learns to produce: <|assistant|> <think> {reasoning} </think> {answer}
         # The loss is computed on ALL assistant tokens including the thinking part.
-
-        # When token_ids is sharded over the 'data' mesh axis (data-parallel
-        # training), JAX's shardy propagation cannot resolve the output sharding
-        # of the gather unambiguously.  Provide it explicitly so XLA doesn't
-        # raise a ShardingTypeError at compile time.
-        emb_weights = self.embedding.embedding.value  # [vocab_size, d_model]
-        out_sharding = NamedSharding(MESH, P("data", None, None))
-        x = emb_weights.at[token_ids].get(out_sharding=out_sharding)
+        x = self.embedding(token_ids)
 
         for block in self.blocks:
             x = block(x)
@@ -572,9 +563,7 @@ class NemotronNanoBlock(nnx.Module):
             logits:     Output logits, shape (batch, vocab_size).
             new_caches: Updated NemotronCache to pass to the next step().
         """
-        # Single-token gather; output is (batch, d_model) — 2 dims.
-        emb_weights = self.embedding.embedding.value
-        x = emb_weights.at[token_id].get(out_sharding=NamedSharding(MESH, P("data", None)))
+        x = self.embedding(token_id)  # (batch, d_model)
 
         new_ssm_caches: list[SSMCache] = []
         new_kv_caches: list[KVCache | None] = []
