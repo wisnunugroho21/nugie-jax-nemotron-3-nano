@@ -51,13 +51,11 @@ from moe import SparseMoE
 
 def _default_patterns() -> list[tuple[str, int]]:
     return [
-        ("mamba_moe", 3),
+        ("mamba_moe", 4),
         ("mamba_attention_moe", 1),
-        ("mamba_moe", 3),
+        ("mamba_moe", 4),
         ("mamba_attention_moe", 1),
-        ("mamba_moe", 3),
-        ("mamba_attention_moe", 1),
-        ("mamba_moe", 3),
+        ("mamba_moe", 4),
         ("mamba_attention_moe", 1),
     ]
 
